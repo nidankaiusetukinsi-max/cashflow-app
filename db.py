@@ -1,12 +1,9 @@
-"""SQLite persistence for the cash flow tracker."""
-
-import sqlite3
-from pathlib import Path
+"""PostgreSQL (Neon) persistence for the cash flow tracker."""
 
 import pandas as pd
+import psycopg2
+import psycopg2.extensions
 import streamlit as st
-
-DB_PATH = Path(__file__).parent / "cashflow.db"
 
 INCOME_CATEGORIES = ["給与", "副業", "投資", "その他収入"]
 EXPENSE_CATEGORIES = ["食費", "住居", "光熱費", "交通", "娯楽", "医療", "育児", "その他支出"]
@@ -35,76 +32,49 @@ SETTINGS_KEYS = [
 ]
 
 
-def _migrate_transactions_type_check(conn: sqlite3.Connection) -> None:
-    """Widen the legacy `type IN ('income', 'expense')` check to include 'investment'."""
-    row = conn.execute(
-        "SELECT sql FROM sqlite_master WHERE type='table' AND name='transactions'"
-    ).fetchone()
-    if row is None or "'investment'" in row[0]:
-        return
-    conn.execute("ALTER TABLE transactions RENAME TO transactions_old")
-    conn.execute(
-        """
-        CREATE TABLE transactions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            date TEXT NOT NULL,
-            type TEXT NOT NULL CHECK (type IN ('income', 'expense', 'investment')),
-            category TEXT NOT NULL,
-            amount REAL NOT NULL,
-            memo TEXT
-        )
-        """
-    )
-    conn.execute(
-        "INSERT INTO transactions (id, date, type, category, amount, memo) "
-        "SELECT id, date, type, category, amount, memo FROM transactions_old"
-    )
-    conn.execute("DROP TABLE transactions_old")
-    conn.commit()
-
-
 @st.cache_resource
-def get_connection() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS transactions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            date TEXT NOT NULL,
-            type TEXT NOT NULL CHECK (type IN ('income', 'expense', 'investment')),
-            category TEXT NOT NULL,
-            amount REAL NOT NULL,
-            memo TEXT
+def get_connection() -> psycopg2.extensions.connection:
+    conn = psycopg2.connect(st.secrets["DATABASE_URL"])
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS transactions (
+                id SERIAL PRIMARY KEY,
+                date DATE NOT NULL,
+                type TEXT NOT NULL CHECK (type IN ('income', 'expense', 'investment')),
+                category TEXT NOT NULL,
+                amount DOUBLE PRECISION NOT NULL,
+                memo TEXT
+            )
+            """
         )
-        """
-    )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS budgets (
-            category TEXT PRIMARY KEY,
-            monthly_limit REAL NOT NULL
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS budgets (
+                category TEXT PRIMARY KEY,
+                monthly_limit DOUBLE PRECISION NOT NULL
+            )
+            """
         )
-        """
-    )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value REAL NOT NULL
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value DOUBLE PRECISION NOT NULL
+            )
+            """
         )
-        """
-    )
     conn.commit()
-    _migrate_transactions_type_check(conn)
     return conn
 
 
 def add_transaction(date: str, type_: str, category: str, amount: float, memo: str) -> None:
     conn = get_connection()
-    conn.execute(
-        "INSERT INTO transactions (date, type, category, amount, memo) VALUES (?, ?, ?, ?, ?)",
-        (date, type_, category, amount, memo),
-    )
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO transactions (date, type, category, amount, memo) VALUES (%s, %s, %s, %s, %s)",
+            (date, type_, category, amount, memo),
+        )
     conn.commit()
 
 
@@ -113,8 +83,8 @@ def get_transactions() -> pd.DataFrame:
     df = pd.read_sql_query(
         "SELECT id, date, type, category, amount, memo FROM transactions ORDER BY date DESC, id DESC",
         conn,
-        parse_dates=["date"],
     )
+    df["date"] = pd.to_datetime(df["date"])
     return df
 
 
@@ -122,45 +92,53 @@ def delete_transactions(ids: list[int]) -> None:
     if not ids:
         return
     conn = get_connection()
-    placeholders = ",".join("?" for _ in ids)
-    conn.execute(f"DELETE FROM transactions WHERE id IN ({placeholders})", ids)
+    with conn.cursor() as cur:
+        placeholders = ",".join("%s" for _ in ids)
+        cur.execute(f"DELETE FROM transactions WHERE id IN ({placeholders})", ids)
     conn.commit()
 
 
 def set_budget(category: str, monthly_limit: float) -> None:
     conn = get_connection()
-    conn.execute(
-        "INSERT INTO budgets (category, monthly_limit) VALUES (?, ?) "
-        "ON CONFLICT(category) DO UPDATE SET monthly_limit = excluded.monthly_limit",
-        (category, monthly_limit),
-    )
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO budgets (category, monthly_limit) VALUES (%s, %s) "
+            "ON CONFLICT (category) DO UPDATE SET monthly_limit = excluded.monthly_limit",
+            (category, monthly_limit),
+        )
     conn.commit()
 
 
 def delete_budget(category: str) -> None:
     conn = get_connection()
-    conn.execute("DELETE FROM budgets WHERE category = ?", (category,))
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM budgets WHERE category = %s", (category,))
     conn.commit()
 
 
 def get_budgets() -> dict[str, float]:
     conn = get_connection()
-    rows = conn.execute("SELECT category, monthly_limit FROM budgets").fetchall()
+    with conn.cursor() as cur:
+        cur.execute("SELECT category, monthly_limit FROM budgets")
+        rows = cur.fetchall()
     return dict(rows)
 
 
 def set_setting(key: str, value: float) -> None:
     conn = get_connection()
-    conn.execute(
-        "INSERT INTO settings (key, value) VALUES (?, ?) "
-        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        (key, value),
-    )
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO settings (key, value) VALUES (%s, %s) "
+            "ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )
     conn.commit()
 
 
 def get_settings() -> dict[str, float]:
     conn = get_connection()
-    rows = conn.execute("SELECT key, value FROM settings").fetchall()
+    with conn.cursor() as cur:
+        cur.execute("SELECT key, value FROM settings")
+        rows = cur.fetchall()
     values = dict(rows)
     return {key: values.get(key, 0.0) for key in SETTINGS_KEYS}

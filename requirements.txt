@@ -1,3 +1,4 @@
 streamlit>=1.57
 pandas
 altair
+psycopg2-binary
