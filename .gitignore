@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+cashflow.db
+.streamlit/secrets.toml
