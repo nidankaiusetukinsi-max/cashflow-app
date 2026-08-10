@@ -15,6 +15,8 @@ from db import (
     NISA_GROWTH_LIFETIME_LIMIT,
     NISA_LIFETIME_LIMIT,
     NISA_TSUMITATE_ANNUAL_LIMIT,
+    SETTING_ANNUAL_EXPENSE_TARGET,
+    SETTING_ANNUAL_INCOME_TARGET,
     SETTING_GROWTH_LIFETIME_BEFORE,
     SETTING_GROWTH_YTD_BEFORE,
     SETTING_INITIAL_CASH,
@@ -124,7 +126,7 @@ with st.sidebar:
 # Data
 # =============================================================================
 
-st.markdown("# :material/payments: キャッシュフロー管理")
+st.markdown("### :material/payments: キャッシュフロー管理")
 
 all_transactions = get_transactions()
 budgets = get_budgets()
@@ -171,6 +173,82 @@ with tab_dashboard:
         st.markdown("### 健全化アドバイス")
         for tip in generate_advice(all_transactions, budgets, settings):
             st.info(tip, icon=":material/lightbulb:")
+
+        income_target = settings[SETTING_ANNUAL_INCOME_TARGET]
+        expense_target = settings[SETTING_ANNUAL_EXPENSE_TARGET]
+        if income_target > 0 or expense_target > 0:
+            st.markdown("### 年間目標との比較")
+            this_year_num = date.today().year
+            elapsed_ratio = date.today().timetuple().tm_yday / 365
+            this_year_all = all_transactions[all_transactions["date"].dt.year == this_year_num]
+
+            target_cols = st.columns(2)
+            if income_target > 0:
+                income_ytd = this_year_all.loc[this_year_all["type"] == "income", "amount"].sum()
+                income_pace = income_target * elapsed_ratio
+                with target_cols[0]:
+                    st.metric(
+                        "今年の収入実績",
+                        f"¥{income_ytd:,.0f}",
+                        delta=f"¥{income_ytd - income_pace:,.0f}（対目標ペース）",
+                        help=f"年間目標 ¥{income_target:,.0f} に対し、経過{elapsed_ratio * 100:.0f}%時点の目標ペースは ¥{income_pace:,.0f}",
+                    )
+            if expense_target > 0:
+                expense_ytd = this_year_all.loc[this_year_all["type"] == "expense", "amount"].sum()
+                expense_pace = expense_target * elapsed_ratio
+                with target_cols[1]:
+                    st.metric(
+                        "今年の支出実績",
+                        f"¥{expense_ytd:,.0f}",
+                        delta=f"¥{expense_ytd - expense_pace:,.0f}（対目標ペース）",
+                        delta_color="inverse",
+                        help=f"年間目標 ¥{expense_target:,.0f} に対し、経過{elapsed_ratio * 100:.0f}%時点の目標ペースは ¥{expense_pace:,.0f}",
+                    )
+
+            target_chart_cols = st.columns(2)
+            year_start = pd.Timestamp(date(this_year_num, 1, 1))
+            year_end = pd.Timestamp(date(this_year_num, 12, 31))
+
+            def render_target_progress_chart(type_: str, target_annual: float) -> alt.Chart:
+                type_df = this_year_all[this_year_all["type"] == type_]
+                actual = type_df.groupby("date", as_index=False)["amount"].sum().sort_values("date")
+                actual["累計"] = actual["amount"].cumsum()
+                actual_series = pd.DataFrame(
+                    {"日付": actual["date"], "系列": "実績", "金額": actual["累計"]}
+                )
+                target_series = pd.DataFrame(
+                    {"日付": [year_start, year_end], "系列": "目標ペース", "金額": [0, target_annual]}
+                )
+                combined = pd.concat([actual_series, target_series], ignore_index=True)
+                return (
+                    alt.Chart(combined)
+                    .mark_line()
+                    .encode(
+                        x=alt.X("日付:T", title=None),
+                        y=alt.Y("金額:Q", title=None),
+                        color=alt.Color("系列:N", title=None, legend=alt.Legend(orient="bottom")),
+                        strokeDash=alt.condition(
+                            alt.datum.系列 == "目標ペース", alt.value([5, 5]), alt.value([0])
+                        ),
+                        tooltip=[
+                            alt.Tooltip("日付:T", title="日付", format="%Y-%m-%d"),
+                            alt.Tooltip("系列:N", title="系列"),
+                            alt.Tooltip("金額:Q", title="金額", format=",.0f"),
+                        ],
+                    )
+                    .properties(height=300)
+                )
+
+            if income_target > 0:
+                with target_chart_cols[0]:
+                    with st.container(border=True):
+                        st.markdown("**収入: 実績 vs 目標ペース**")
+                        st.altair_chart(render_target_progress_chart("income", income_target))
+            if expense_target > 0:
+                with target_chart_cols[1]:
+                    with st.container(border=True):
+                        st.markdown("**支出: 実績 vs 目標ペース**")
+                        st.altair_chart(render_target_progress_chart("expense", expense_target))
 
         chart_cols = st.columns(2)
 
@@ -419,11 +497,30 @@ with tab_settings:
                 key="growth_lifetime_input",
             )
 
+        st.markdown("##### 年間目標")
+        target_cols_input = st.columns(2)
+        with target_cols_input[0]:
+            annual_income_target = st.number_input(
+                "手取り年収（目標）",
+                min_value=0,
+                step=10000,
+                value=int(settings[SETTING_ANNUAL_INCOME_TARGET]),
+            )
+        with target_cols_input[1]:
+            annual_expense_target = st.number_input(
+                "年間目標支出",
+                min_value=0,
+                step=10000,
+                value=int(settings[SETTING_ANNUAL_EXPENSE_TARGET]),
+            )
+
         if st.form_submit_button("保存", type="primary"):
             set_setting(SETTING_INITIAL_CASH, initial_cash)
             set_setting(SETTING_TSUMITATE_YTD_BEFORE, tsumitate_ytd)
             set_setting(SETTING_TSUMITATE_LIFETIME_BEFORE, tsumitate_lifetime)
             set_setting(SETTING_GROWTH_YTD_BEFORE, growth_ytd)
             set_setting(SETTING_GROWTH_LIFETIME_BEFORE, growth_lifetime)
+            set_setting(SETTING_ANNUAL_INCOME_TARGET, annual_income_target)
+            set_setting(SETTING_ANNUAL_EXPENSE_TARGET, annual_expense_target)
             st.toast("初期設定を保存しました。", icon=":material/check_circle:")
             st.rerun()
