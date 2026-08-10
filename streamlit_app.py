@@ -22,7 +22,11 @@ from db import (
     SETTING_CHILDCARE_ANNUAL_COST,
     SETTING_CHILDCARE_END_AGE,
     SETTING_GROWTH_LIFETIME_BEFORE,
+    SETTING_GROWTH_LIFETIME_BEFORE_HUSBAND,
+    SETTING_GROWTH_LIFETIME_BEFORE_WIFE,
     SETTING_GROWTH_YTD_BEFORE,
+    SETTING_GROWTH_YTD_BEFORE_HUSBAND,
+    SETTING_GROWTH_YTD_BEFORE_WIFE,
     SETTING_HUSBAND_BIRTH_YEAR,
     SETTING_HUSBAND_PENSION_ANNUAL,
     SETTING_HUSBAND_PENSION_START_AGE,
@@ -32,7 +36,11 @@ from db import (
     SETTING_MORTGAGE_MONTHLY_PAYMENT,
     SETTING_MORTGAGE_PAYOFF_YEAR,
     SETTING_TSUMITATE_LIFETIME_BEFORE,
+    SETTING_TSUMITATE_LIFETIME_BEFORE_HUSBAND,
+    SETTING_TSUMITATE_LIFETIME_BEFORE_WIFE,
     SETTING_TSUMITATE_YTD_BEFORE,
+    SETTING_TSUMITATE_YTD_BEFORE_HUSBAND,
+    SETTING_TSUMITATE_YTD_BEFORE_WIFE,
     SETTING_WIFE_BIRTH_YEAR,
     SETTING_WIFE_PENSION_ANNUAL,
     SETTING_WIFE_PENSION_START_AGE,
@@ -40,18 +48,22 @@ from db import (
     add_account,
     add_child,
     add_recurring_expense,
+    add_recurring_investment,
     add_transaction,
     add_transfer,
     apply_recurring_expenses,
+    apply_recurring_investments,
     delete_account,
     delete_budget,
     delete_child,
     delete_recurring_expense,
+    delete_recurring_investment,
     delete_transactions,
     get_accounts,
     get_budgets,
     get_children,
     get_recurring_expenses,
+    get_recurring_investments,
     get_settings,
     get_transactions,
     set_budget,
@@ -118,6 +130,7 @@ def filter_by_time_range(df: pd.DataFrame, time_range: str) -> pd.DataFrame:
 # =============================================================================
 
 apply_recurring_expenses()
+apply_recurring_investments()
 
 all_transactions = get_transactions()
 budgets = get_budgets()
@@ -144,8 +157,10 @@ current_balance = settings[SETTING_INITIAL_CASH] + untagged_net + sum(account_ba
 
 nisa_lifetime_total = (
     all_transactions.loc[all_transactions["type"] == "investment", "amount"].sum()
-    + settings[SETTING_TSUMITATE_LIFETIME_BEFORE]
-    + settings[SETTING_GROWTH_LIFETIME_BEFORE]
+    + settings[SETTING_TSUMITATE_LIFETIME_BEFORE_HUSBAND]
+    + settings[SETTING_TSUMITATE_LIFETIME_BEFORE_WIFE]
+    + settings[SETTING_GROWTH_LIFETIME_BEFORE_HUSBAND]
+    + settings[SETTING_GROWTH_LIFETIME_BEFORE_WIFE]
 )
 total_assets = current_balance + nisa_lifetime_total
 
@@ -174,7 +189,11 @@ with st.sidebar:
         entry_amount = st.number_input("金額", min_value=0, step=100)
         entry_memo = st.text_input("メモ", label_visibility="collapsed", placeholder="メモ（任意）")
 
-        account_labels = {"未設定": None}
+        entry_owner = None
+        if entry_type == "投資(NISA)":
+            entry_owner = st.selectbox("所有者", options=OWNERS, key="entry_owner")
+
+        account_labels = {"現金": None}
         for row in accounts_df.itertuples():
             account_labels[f"{row.owner}: {row.name}（{ACCOUNT_KINDS[row.kind]}）"] = row.id
         entry_account_label = st.selectbox("口座/カード", options=list(account_labels.keys()))
@@ -188,6 +207,7 @@ with st.sidebar:
                 amount=entry_amount,
                 memo=entry_memo,
                 account_id=account_labels[entry_account_label],
+                owner=entry_owner,
             )
             st.rerun()
 
@@ -378,7 +398,7 @@ with tab_dashboard:
 
         display_df = all_transactions.copy()
         display_df["type"] = display_df["type"].map(TYPE_LABELS)
-        display_df["account"] = display_df["account_id"].map(account_name_map).fillna("未設定")
+        display_df["account"] = display_df["account_id"].map(account_name_map).fillna("現金")
         is_transfer = all_transactions["type"] == "transfer"
         display_df.loc[is_transfer, "account"] = (
             all_transactions.loc[is_transfer, "account_id"].map(account_name_map)
@@ -421,66 +441,143 @@ with tab_dashboard:
 with tab_nisa:
     st.caption(
         "新NISA制度は簿価残高方式（売却すると翌年に枠が復活）ですが、"
-        "ここでは単純に拠出累計額で消化率を近似表示しています。"
-        "「初期設定」タブで登録した既存の拠出額も合算されます。"
+        "ここでは単純に拠出累計額で消化率を近似表示しています。非課税枠は夫婦一人ずつに割り当てられるため、"
+        "所有者ごとに分けて管理します。「初期設定」タブで登録した既存の拠出額も合算されます。"
     )
 
     investment_df = all_transactions[all_transactions["type"] == "investment"]
     this_year = date.today().year
     investment_this_year = investment_df[investment_df["date"].dt.year == this_year]
 
-    tsumitate_this_year = (
-        investment_this_year.loc[investment_this_year["category"] == "つみたて投資枠", "amount"].sum()
-        + settings[SETTING_TSUMITATE_YTD_BEFORE]
-    )
-    growth_this_year = (
-        investment_this_year.loc[investment_this_year["category"] == "成長投資枠", "amount"].sum()
-        + settings[SETTING_GROWTH_YTD_BEFORE]
-    )
-    tsumitate_lifetime = (
-        investment_df.loc[investment_df["category"] == "つみたて投資枠", "amount"].sum()
-        + settings[SETTING_TSUMITATE_LIFETIME_BEFORE]
-    )
-    growth_lifetime = (
-        investment_df.loc[investment_df["category"] == "成長投資枠", "amount"].sum()
-        + settings[SETTING_GROWTH_LIFETIME_BEFORE]
-    )
+    owner_ytd_keys = {
+        ("夫", "つみたて投資枠"): SETTING_TSUMITATE_YTD_BEFORE_HUSBAND,
+        ("嫁", "つみたて投資枠"): SETTING_TSUMITATE_YTD_BEFORE_WIFE,
+        ("夫", "成長投資枠"): SETTING_GROWTH_YTD_BEFORE_HUSBAND,
+        ("嫁", "成長投資枠"): SETTING_GROWTH_YTD_BEFORE_WIFE,
+    }
+    owner_lifetime_keys = {
+        ("夫", "つみたて投資枠"): SETTING_TSUMITATE_LIFETIME_BEFORE_HUSBAND,
+        ("嫁", "つみたて投資枠"): SETTING_TSUMITATE_LIFETIME_BEFORE_WIFE,
+        ("夫", "成長投資枠"): SETTING_GROWTH_LIFETIME_BEFORE_HUSBAND,
+        ("嫁", "成長投資枠"): SETTING_GROWTH_LIFETIME_BEFORE_WIFE,
+    }
 
-    st.markdown(f"#### {this_year}年の年間枠")
-    annual_cols = st.columns(2)
-    with annual_cols[0]:
-        with st.container(border=True):
-            st.markdown("**つみたて投資枠**")
-            ratio = min(tsumitate_this_year / NISA_TSUMITATE_ANNUAL_LIMIT, 1.0)
-            st.progress(ratio, text=f"¥{tsumitate_this_year:,.0f} / ¥{NISA_TSUMITATE_ANNUAL_LIMIT:,.0f}")
-    with annual_cols[1]:
-        with st.container(border=True):
-            st.markdown("**成長投資枠**")
-            ratio = min(growth_this_year / NISA_GROWTH_ANNUAL_LIMIT, 1.0)
-            st.progress(ratio, text=f"¥{growth_this_year:,.0f} / ¥{NISA_GROWTH_ANNUAL_LIMIT:,.0f}")
+    for owner in OWNERS:
+        st.markdown(f"### {owner}のNISA")
+        owner_investment_df = investment_df[investment_df["owner"] == owner]
+        owner_investment_this_year = investment_this_year[investment_this_year["owner"] == owner]
 
-    st.markdown("#### 生涯投資枠")
-    lifetime_cols = st.columns(2)
-    with lifetime_cols[0]:
-        with st.container(border=True):
-            st.markdown("**成長投資枠（生涯上限あり）**")
-            ratio = min(growth_lifetime / NISA_GROWTH_LIFETIME_LIMIT, 1.0)
-            st.progress(ratio, text=f"¥{growth_lifetime:,.0f} / ¥{NISA_GROWTH_LIFETIME_LIMIT:,.0f}")
-    with lifetime_cols[1]:
-        with st.container(border=True):
-            st.markdown("**生涯投資枠合計**")
-            total_lifetime = tsumitate_lifetime + growth_lifetime
-            ratio = min(total_lifetime / NISA_LIFETIME_LIMIT, 1.0)
-            st.progress(ratio, text=f"¥{total_lifetime:,.0f} / ¥{NISA_LIFETIME_LIMIT:,.0f}")
+        tsumitate_this_year = (
+            owner_investment_this_year.loc[
+                owner_investment_this_year["category"] == "つみたて投資枠", "amount"
+            ].sum()
+            + settings[owner_ytd_keys[(owner, "つみたて投資枠")]]
+        )
+        growth_this_year = (
+            owner_investment_this_year.loc[owner_investment_this_year["category"] == "成長投資枠", "amount"].sum()
+            + settings[owner_ytd_keys[(owner, "成長投資枠")]]
+        )
+        tsumitate_lifetime = (
+            owner_investment_df.loc[owner_investment_df["category"] == "つみたて投資枠", "amount"].sum()
+            + settings[owner_lifetime_keys[(owner, "つみたて投資枠")]]
+        )
+        growth_lifetime = (
+            owner_investment_df.loc[owner_investment_df["category"] == "成長投資枠", "amount"].sum()
+            + settings[owner_lifetime_keys[(owner, "成長投資枠")]]
+        )
+
+        annual_cols = st.columns(2)
+        with annual_cols[0]:
+            with st.container(border=True):
+                st.markdown("**つみたて投資枠（年間）**")
+                ratio = min(tsumitate_this_year / NISA_TSUMITATE_ANNUAL_LIMIT, 1.0)
+                st.progress(ratio, text=f"¥{tsumitate_this_year:,.0f} / ¥{NISA_TSUMITATE_ANNUAL_LIMIT:,.0f}")
+        with annual_cols[1]:
+            with st.container(border=True):
+                st.markdown("**成長投資枠（年間）**")
+                ratio = min(growth_this_year / NISA_GROWTH_ANNUAL_LIMIT, 1.0)
+                st.progress(ratio, text=f"¥{growth_this_year:,.0f} / ¥{NISA_GROWTH_ANNUAL_LIMIT:,.0f}")
+
+        lifetime_cols = st.columns(2)
+        with lifetime_cols[0]:
+            with st.container(border=True):
+                st.markdown("**成長投資枠（生涯上限あり）**")
+                ratio = min(growth_lifetime / NISA_GROWTH_LIFETIME_LIMIT, 1.0)
+                st.progress(ratio, text=f"¥{growth_lifetime:,.0f} / ¥{NISA_GROWTH_LIFETIME_LIMIT:,.0f}")
+        with lifetime_cols[1]:
+            with st.container(border=True):
+                st.markdown("**生涯投資枠合計**")
+                total_lifetime = tsumitate_lifetime + growth_lifetime
+                ratio = min(total_lifetime / NISA_LIFETIME_LIMIT, 1.0)
+                st.progress(ratio, text=f"¥{total_lifetime:,.0f} / ¥{NISA_LIFETIME_LIMIT:,.0f}")
+
+    if investment_df["owner"].isna().any():
+        st.caption(
+            "所有者が未設定の積立データがあります（この機能を追加する前に記録した取引など）。"
+            "上記の進捗には反映されないため、必要であれば取引履歴から記録し直してください。"
+        )
+
+    st.markdown("---")
+    st.markdown("#### 定期積立の設定")
+    st.caption(
+        "毎月自動的にNISA拠出を記録したい場合はここから登録できます。"
+        "指定日を過ぎてからアプリを開くと、その月の分が自動的に積立として記録されます。"
+    )
+    with st.form("add_recurring_investment", clear_on_submit=True):
+        ri_cols = st.columns([1, 1, 1, 2, 1])
+        with ri_cols[0]:
+            ri_owner = st.selectbox("所有者", options=OWNERS, key="ri_owner")
+        with ri_cols[1]:
+            ri_category = st.selectbox("枠", options=NISA_CATEGORIES, key="ri_category")
+        with ri_cols[2]:
+            ri_amount = st.number_input("金額", min_value=0, step=1000, key="ri_amount")
+        with ri_cols[3]:
+            ri_account_labels = {"現金": None}
+            for row in accounts_df.itertuples():
+                ri_account_labels[f"{row.owner}: {row.name}（{ACCOUNT_KINDS[row.kind]}）"] = row.id
+            ri_account_label = st.selectbox(
+                "引き落とし口座/カード", options=list(ri_account_labels.keys()), key="ri_account"
+            )
+        with ri_cols[4]:
+            ri_day = st.number_input("積立日", min_value=1, max_value=28, value=27, step=1, key="ri_day")
+
+        if st.form_submit_button("登録", type="primary"):
+            add_recurring_investment(
+                ri_owner, ri_category, ri_amount, ri_account_labels[ri_account_label], int(ri_day)
+            )
+            st.rerun()
+
+    recurring_investments_df = get_recurring_investments()
+    if recurring_investments_df.empty:
+        st.info("まだ定期積立が登録されていません。")
+    else:
+        for row in recurring_investments_df.itertuples():
+            row_cols = st.columns([1, 1, 1, 2, 1])
+            with row_cols[0]:
+                st.write(row.owner)
+            with row_cols[1]:
+                st.write(row.category)
+            with row_cols[2]:
+                st.write(f"¥{row.amount:,.0f}")
+            with row_cols[3]:
+                account_label = account_name_map.get(row.account_id, "現金")
+                st.write(f"{account_label}（毎月{row.day_of_month}日）")
+            with row_cols[4]:
+                if st.button(":material/delete:", key=f"del_recurring_investment_{row.id}", type="tertiary"):
+                    delete_recurring_investment(row.id)
+                    st.rerun()
 
     st.markdown("#### 積立履歴")
     if investment_df.empty:
         st.info("NISAの積立を記録すると、ここに履歴が表示されます。")
     else:
+        display_investment_df = investment_df.copy()
+        display_investment_df["owner"] = display_investment_df["owner"].fillna("未設定")
         st.dataframe(
-            investment_df[["date", "category", "amount", "memo"]],
+            display_investment_df[["date", "owner", "category", "amount", "memo"]],
             column_config={
                 "date": st.column_config.DateColumn("日付"),
+                "owner": st.column_config.TextColumn("所有者"),
                 "category": st.column_config.TextColumn("枠"),
                 "amount": st.column_config.NumberColumn("金額", format="¥%.0f"),
                 "memo": st.column_config.TextColumn("メモ"),
@@ -543,41 +640,73 @@ with tab_settings:
             label_visibility="collapsed",
         )
 
-        st.markdown("##### NISAつみたて投資枠")
-        nisa_cols_1 = st.columns(2)
-        with nisa_cols_1[0]:
-            tsumitate_ytd = st.number_input(
-                "今年すでに拠出した額",
-                min_value=0,
-                step=1000,
-                value=int(settings[SETTING_TSUMITATE_YTD_BEFORE]),
-            )
-        with nisa_cols_1[1]:
-            tsumitate_lifetime = st.number_input(
-                "制度開始からの拠出累計額（生涯枠）",
-                min_value=0,
-                step=1000,
-                value=int(settings[SETTING_TSUMITATE_LIFETIME_BEFORE]),
-            )
+        st.markdown("##### NISA拠出額（夫婦それぞれ）")
+        st.caption("非課税枠は一人ずつに割り当てられるため、夫・嫁それぞれの拠出額を分けて入力してください。")
 
-        st.markdown("##### NISA成長投資枠")
-        nisa_cols_2 = st.columns(2)
-        with nisa_cols_2[0]:
-            growth_ytd = st.number_input(
-                "今年すでに拠出した額",
-                min_value=0,
-                step=1000,
-                value=int(settings[SETTING_GROWTH_YTD_BEFORE]),
-                key="growth_ytd_input",
-            )
-        with nisa_cols_2[1]:
-            growth_lifetime = st.number_input(
-                "制度開始からの拠出累計額（生涯枠）",
-                min_value=0,
-                step=1000,
-                value=int(settings[SETTING_GROWTH_LIFETIME_BEFORE]),
-                key="growth_lifetime_input",
-            )
+        nisa_owner_keys = {
+            "夫": (
+                SETTING_TSUMITATE_YTD_BEFORE_HUSBAND,
+                SETTING_TSUMITATE_LIFETIME_BEFORE_HUSBAND,
+                SETTING_GROWTH_YTD_BEFORE_HUSBAND,
+                SETTING_GROWTH_LIFETIME_BEFORE_HUSBAND,
+            ),
+            "嫁": (
+                SETTING_TSUMITATE_YTD_BEFORE_WIFE,
+                SETTING_TSUMITATE_LIFETIME_BEFORE_WIFE,
+                SETTING_GROWTH_YTD_BEFORE_WIFE,
+                SETTING_GROWTH_LIFETIME_BEFORE_WIFE,
+            ),
+        }
+        # 所有者別に分ける前の合算値が残っていれば、夫の欄に初期値として引き継ぐ（データ消失防止）。
+        legacy_nisa_defaults = {
+            "夫": (
+                int(settings[SETTING_TSUMITATE_YTD_BEFORE]),
+                int(settings[SETTING_TSUMITATE_LIFETIME_BEFORE]),
+                int(settings[SETTING_GROWTH_YTD_BEFORE]),
+                int(settings[SETTING_GROWTH_LIFETIME_BEFORE]),
+            ),
+            "嫁": (0, 0, 0, 0),
+        }
+
+        nisa_owner_inputs: dict[str, tuple[int, int, int, int]] = {}
+        for nisa_owner in OWNERS:
+            ytd_t_key, life_t_key, ytd_g_key, life_g_key = nisa_owner_keys[nisa_owner]
+            legacy_ytd_t, legacy_life_t, legacy_ytd_g, legacy_life_g = legacy_nisa_defaults[nisa_owner]
+            st.markdown(f"**{nisa_owner}**")
+            o_cols = st.columns(4)
+            with o_cols[0]:
+                o_ytd_t = st.number_input(
+                    "つみたて: 今年の拠出額",
+                    min_value=0,
+                    step=1000,
+                    value=int(settings[ytd_t_key]) or legacy_ytd_t,
+                    key=f"nisa_{nisa_owner}_ytd_t",
+                )
+            with o_cols[1]:
+                o_life_t = st.number_input(
+                    "つみたて: 生涯拠出累計額",
+                    min_value=0,
+                    step=1000,
+                    value=int(settings[life_t_key]) or legacy_life_t,
+                    key=f"nisa_{nisa_owner}_life_t",
+                )
+            with o_cols[2]:
+                o_ytd_g = st.number_input(
+                    "成長: 今年の拠出額",
+                    min_value=0,
+                    step=1000,
+                    value=int(settings[ytd_g_key]) or legacy_ytd_g,
+                    key=f"nisa_{nisa_owner}_ytd_g",
+                )
+            with o_cols[3]:
+                o_life_g = st.number_input(
+                    "成長: 生涯拠出累計額",
+                    min_value=0,
+                    step=1000,
+                    value=int(settings[life_g_key]) or legacy_life_g,
+                    key=f"nisa_{nisa_owner}_life_g",
+                )
+            nisa_owner_inputs[nisa_owner] = (o_ytd_t, o_life_t, o_ytd_g, o_life_g)
 
         st.markdown("##### 年収・支出設定")
         target_cols_input = st.columns(2)
@@ -600,10 +729,12 @@ with tab_settings:
 
         if st.form_submit_button("保存", type="primary"):
             set_setting(SETTING_INITIAL_CASH, initial_cash)
-            set_setting(SETTING_TSUMITATE_YTD_BEFORE, tsumitate_ytd)
-            set_setting(SETTING_TSUMITATE_LIFETIME_BEFORE, tsumitate_lifetime)
-            set_setting(SETTING_GROWTH_YTD_BEFORE, growth_ytd)
-            set_setting(SETTING_GROWTH_LIFETIME_BEFORE, growth_lifetime)
+            for nisa_owner, (o_ytd_t, o_life_t, o_ytd_g, o_life_g) in nisa_owner_inputs.items():
+                ytd_t_key, life_t_key, ytd_g_key, life_g_key = nisa_owner_keys[nisa_owner]
+                set_setting(ytd_t_key, o_ytd_t)
+                set_setting(life_t_key, o_life_t)
+                set_setting(ytd_g_key, o_ytd_g)
+                set_setting(life_g_key, o_life_g)
             set_setting(SETTING_ANNUAL_INCOME, annual_income)
             set_setting(SETTING_ANNUAL_EXPENSE_TARGET, annual_expense_target)
             st.toast("初期設定を保存しました。", icon=":material/check_circle:")
@@ -715,7 +846,7 @@ with tab_recurring:
         with rec_cols[2]:
             rec_amount = st.number_input("金額", min_value=0, step=100, key="rec_amount")
         with rec_cols[3]:
-            rec_account_labels = {"未設定": None}
+            rec_account_labels = {"現金": None}
             for row in accounts_df.itertuples():
                 rec_account_labels[f"{row.owner}: {row.name}（{ACCOUNT_KINDS[row.kind]}）"] = row.id
             rec_account_label = st.selectbox(
@@ -750,7 +881,7 @@ with tab_recurring:
             with row_cols[2]:
                 st.write(f"¥{row.amount:,.0f}")
             with row_cols[3]:
-                account_label = account_name_map.get(row.account_id, "未設定")
+                account_label = account_name_map.get(row.account_id, "現金")
                 st.write(f"{account_label}（毎月{row.day_of_month}日）")
             with row_cols[4]:
                 if st.button(":material/delete:", key=f"del_recurring_{row.id}", type="tertiary"):

@@ -7,10 +7,20 @@ import pandas as pd
 from db import (
     NISA_GROWTH_ANNUAL_LIMIT,
     NISA_TSUMITATE_ANNUAL_LIMIT,
+    OWNERS,
     SETTING_ANNUAL_INCOME,
-    SETTING_GROWTH_YTD_BEFORE,
-    SETTING_TSUMITATE_YTD_BEFORE,
+    SETTING_GROWTH_YTD_BEFORE_HUSBAND,
+    SETTING_GROWTH_YTD_BEFORE_WIFE,
+    SETTING_TSUMITATE_YTD_BEFORE_HUSBAND,
+    SETTING_TSUMITATE_YTD_BEFORE_WIFE,
 )
+
+_YTD_SETTING_KEYS = {
+    ("夫", "つみたて投資枠"): SETTING_TSUMITATE_YTD_BEFORE_HUSBAND,
+    ("嫁", "つみたて投資枠"): SETTING_TSUMITATE_YTD_BEFORE_WIFE,
+    ("夫", "成長投資枠"): SETTING_GROWTH_YTD_BEFORE_HUSBAND,
+    ("嫁", "成長投資枠"): SETTING_GROWTH_YTD_BEFORE_WIFE,
+}
 
 
 def generate_advice(
@@ -58,35 +68,35 @@ def generate_advice(
                     f"（実績¥{actual:,.0f} / 予算¥{limit:,.0f}）。"
                 )
 
-    # --- NISA消化ペース ---
+    # --- NISA消化ペース（夫婦それぞれの非課税枠ごとに判定） ---
     elapsed_ratio = today.timetuple().tm_yday / 365
     investment_this_year = this_year[this_year["type"] == "investment"]
-    ytd_baseline = {
-        "つみたて投資枠": settings.get(SETTING_TSUMITATE_YTD_BEFORE, 0.0),
-        "成長投資枠": settings.get(SETTING_GROWTH_YTD_BEFORE, 0.0),
-    }
 
-    for category, annual_limit in (
-        ("つみたて投資枠", NISA_TSUMITATE_ANNUAL_LIMIT),
-        ("成長投資枠", NISA_GROWTH_ANNUAL_LIMIT),
-    ):
-        contributed = (
-            investment_this_year.loc[investment_this_year["category"] == category, "amount"].sum()
-            + ytd_baseline[category]
-        )
-        if contributed == 0:
-            continue
-        pace_ratio = contributed / annual_limit
-        if pace_ratio < elapsed_ratio - 0.1:
-            remaining_months = max(12 - today.month + 1, 1)
-            needed_monthly = (annual_limit - contributed) / remaining_months
-            advice.append(
-                f"{category}の消化ペースがやや遅れています"
-                f"（年間上限¥{annual_limit:,.0f}のうち¥{contributed:,.0f}拠出済み）。"
-                f"年内に使い切るには月あたり¥{needed_monthly:,.0f}程度のペースが必要です。"
+    for owner in OWNERS:
+        owner_investment_this_year = investment_this_year[investment_this_year["owner"] == owner]
+        for category, annual_limit in (
+            ("つみたて投資枠", NISA_TSUMITATE_ANNUAL_LIMIT),
+            ("成長投資枠", NISA_GROWTH_ANNUAL_LIMIT),
+        ):
+            contributed = (
+                owner_investment_this_year.loc[
+                    owner_investment_this_year["category"] == category, "amount"
+                ].sum()
+                + settings.get(_YTD_SETTING_KEYS[(owner, category)], 0.0)
             )
-        elif pace_ratio >= 0.99:
-            advice.append(f"{category}は年間上限まで拠出済みです。")
+            if contributed == 0:
+                continue
+            pace_ratio = contributed / annual_limit
+            if pace_ratio < elapsed_ratio - 0.1:
+                remaining_months = max(12 - today.month + 1, 1)
+                needed_monthly = (annual_limit - contributed) / remaining_months
+                advice.append(
+                    f"{owner}の{category}の消化ペースがやや遅れています"
+                    f"（年間上限¥{annual_limit:,.0f}のうち¥{contributed:,.0f}拠出済み）。"
+                    f"年内に使い切るには月あたり¥{needed_monthly:,.0f}程度のペースが必要です。"
+                )
+            elif pace_ratio >= 0.99:
+                advice.append(f"{owner}の{category}は年間上限まで拠出済みです。")
 
     if not advice:
         advice.append("取引を記録すると、ここに家計の健全化アドバイスが表示されます。")

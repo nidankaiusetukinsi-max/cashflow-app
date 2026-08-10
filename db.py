@@ -46,6 +46,16 @@ SETTING_WIFE_PENSION_ANNUAL = "wife_pension_annual"
 SETTING_CHILDCARE_ANNUAL_COST = "childcare_annual_cost"
 SETTING_CHILDCARE_END_AGE = "childcare_end_age"
 
+# NISA拠出額（夫婦それぞれ）。非課税枠は一人ずつに割り当てられるため個別に管理する。
+SETTING_TSUMITATE_YTD_BEFORE_HUSBAND = "tsumitate_ytd_before_husband"
+SETTING_TSUMITATE_YTD_BEFORE_WIFE = "tsumitate_ytd_before_wife"
+SETTING_TSUMITATE_LIFETIME_BEFORE_HUSBAND = "tsumitate_lifetime_before_husband"
+SETTING_TSUMITATE_LIFETIME_BEFORE_WIFE = "tsumitate_lifetime_before_wife"
+SETTING_GROWTH_YTD_BEFORE_HUSBAND = "growth_ytd_before_husband"
+SETTING_GROWTH_YTD_BEFORE_WIFE = "growth_ytd_before_wife"
+SETTING_GROWTH_LIFETIME_BEFORE_HUSBAND = "growth_lifetime_before_husband"
+SETTING_GROWTH_LIFETIME_BEFORE_WIFE = "growth_lifetime_before_wife"
+
 SETTINGS_KEYS = [
     SETTING_INITIAL_CASH,
     SETTING_TSUMITATE_LIFETIME_BEFORE,
@@ -67,6 +77,14 @@ SETTINGS_KEYS = [
     SETTING_WIFE_PENSION_ANNUAL,
     SETTING_CHILDCARE_ANNUAL_COST,
     SETTING_CHILDCARE_END_AGE,
+    SETTING_TSUMITATE_YTD_BEFORE_HUSBAND,
+    SETTING_TSUMITATE_YTD_BEFORE_WIFE,
+    SETTING_TSUMITATE_LIFETIME_BEFORE_HUSBAND,
+    SETTING_TSUMITATE_LIFETIME_BEFORE_WIFE,
+    SETTING_GROWTH_YTD_BEFORE_HUSBAND,
+    SETTING_GROWTH_YTD_BEFORE_WIFE,
+    SETTING_GROWTH_LIFETIME_BEFORE_HUSBAND,
+    SETTING_GROWTH_LIFETIME_BEFORE_WIFE,
 ]
 
 
@@ -104,6 +122,23 @@ def get_connection() -> psycopg2.extensions.connection:
         cur.execute(
             "ALTER TABLE transactions ADD COLUMN IF NOT EXISTS "
             "to_account_id INTEGER REFERENCES accounts(id) ON DELETE SET NULL"
+        )
+        cur.execute("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS owner TEXT")
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS recurring_investments (
+                id SERIAL PRIMARY KEY,
+                owner TEXT NOT NULL CHECK (owner IN ('夫', '嫁')),
+                category TEXT NOT NULL CHECK (category IN ('つみたて投資枠', '成長投資枠')),
+                amount DOUBLE PRECISION NOT NULL,
+                account_id INTEGER REFERENCES accounts(id) ON DELETE SET NULL,
+                day_of_month INTEGER NOT NULL CHECK (day_of_month BETWEEN 1 AND 28)
+            )
+            """
+        )
+        cur.execute(
+            "ALTER TABLE transactions ADD COLUMN IF NOT EXISTS "
+            "recurring_investment_id INTEGER REFERENCES recurring_investments(id) ON DELETE SET NULL"
         )
         cur.execute(
             """
@@ -172,14 +207,20 @@ def _with_reconnect(func):
 
 @_with_reconnect
 def add_transaction(
-    date: str, type_: str, category: str, amount: float, memo: str, account_id: int | None = None
+    date: str,
+    type_: str,
+    category: str,
+    amount: float,
+    memo: str,
+    account_id: int | None = None,
+    owner: str | None = None,
 ) -> None:
     conn = get_connection()
     with conn.cursor() as cur:
         cur.execute(
-            "INSERT INTO transactions (date, type, category, amount, memo, account_id) "
-            "VALUES (%s, %s, %s, %s, %s, %s)",
-            (date, type_, category, amount, memo, account_id),
+            "INSERT INTO transactions (date, type, category, amount, memo, account_id, owner) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+            (date, type_, category, amount, memo, account_id, owner),
         )
     conn.commit()
 
@@ -188,7 +229,7 @@ def add_transaction(
 def get_transactions() -> pd.DataFrame:
     conn = get_connection()
     df = pd.read_sql_query(
-        "SELECT id, date, type, category, amount, memo, account_id, to_account_id "
+        "SELECT id, date, type, category, amount, memo, account_id, to_account_id, owner "
         "FROM transactions ORDER BY date DESC, id DESC",
         conn,
     )
@@ -355,6 +396,69 @@ def apply_recurring_expenses() -> None:
                 "INSERT INTO transactions (date, type, category, amount, memo, account_id, recurring_expense_id) "
                 "VALUES (%s, 'expense', %s, %s, %s, %s, %s)",
                 (applied_date, category, amount, f"{name}（固定費自動引き落とし）", account_id, rec_id),
+            )
+    conn.commit()
+
+
+@_with_reconnect
+def add_recurring_investment(
+    owner: str, category: str, amount: float, account_id: int | None, day_of_month: int
+) -> None:
+    conn = get_connection()
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO recurring_investments (owner, category, amount, account_id, day_of_month) "
+            "VALUES (%s, %s, %s, %s, %s)",
+            (owner, category, amount, account_id, day_of_month),
+        )
+    conn.commit()
+
+
+@_with_reconnect
+def delete_recurring_investment(recurring_id: int) -> None:
+    conn = get_connection()
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM recurring_investments WHERE id = %s", (recurring_id,))
+    conn.commit()
+
+
+@_with_reconnect
+def get_recurring_investments() -> pd.DataFrame:
+    conn = get_connection()
+    df = pd.read_sql_query(
+        "SELECT id, owner, category, amount, account_id, day_of_month "
+        "FROM recurring_investments ORDER BY day_of_month, id",
+        conn,
+    )
+    return df
+
+
+@_with_reconnect
+def apply_recurring_investments() -> None:
+    """Insert this month's NISA contribution transaction once its day has passed, per recurring setup."""
+    conn = get_connection()
+    today = date_.today()
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT id, owner, category, amount, account_id, day_of_month FROM recurring_investments"
+        )
+        rows = cur.fetchall()
+        for rec_id, owner, category, amount, account_id, day_of_month in rows:
+            if today.day < day_of_month:
+                continue
+            cur.execute(
+                "SELECT 1 FROM transactions WHERE recurring_investment_id = %s "
+                "AND EXTRACT(YEAR FROM date) = %s AND EXTRACT(MONTH FROM date) = %s LIMIT 1",
+                (rec_id, today.year, today.month),
+            )
+            if cur.fetchone():
+                continue
+            applied_date = date_(today.year, today.month, day_of_month)
+            cur.execute(
+                "INSERT INTO transactions "
+                "(date, type, category, amount, memo, account_id, owner, recurring_investment_id) "
+                "VALUES (%s, 'investment', %s, %s, %s, %s, %s, %s)",
+                (applied_date, category, amount, f"{owner}の定期積立", account_id, owner, rec_id),
             )
     conn.commit()
 
