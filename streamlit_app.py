@@ -25,12 +25,17 @@ from db import (
     SETTING_TSUMITATE_LIFETIME_BEFORE,
     SETTING_TSUMITATE_YTD_BEFORE,
     add_account,
+    add_recurring_expense,
     add_transaction,
+    add_transfer,
+    apply_recurring_expenses,
     delete_account,
     delete_budget,
+    delete_recurring_expense,
     delete_transactions,
     get_accounts,
     get_budgets,
+    get_recurring_expenses,
     get_settings,
     get_transactions,
     set_budget,
@@ -68,7 +73,7 @@ if not check_password():
 
 
 TIME_RANGES = ["1ヶ月", "6ヶ月", "1年", "今年", "すべて"]
-TYPE_LABELS = {"income": "収入", "expense": "支出", "investment": "投資(NISA)"}
+TYPE_LABELS = {"income": "収入", "expense": "支出", "investment": "投資(NISA)", "transfer": "振替"}
 
 
 def filter_by_time_range(df: pd.DataFrame, time_range: str) -> pd.DataFrame:
@@ -95,18 +100,37 @@ def filter_by_time_range(df: pd.DataFrame, time_range: str) -> pd.DataFrame:
 # Data
 # =============================================================================
 
+apply_recurring_expenses()
+
 all_transactions = get_transactions()
 budgets = get_budgets()
 settings = get_settings()
 accounts_df = get_accounts()
+recurring_df = get_recurring_expenses()
+
+account_name_map: dict[int, str] = {row.id: f"{row.owner}: {row.name}" for row in accounts_df.itertuples()}
 
 all_transactions["signed_amount"] = all_transactions["amount"].where(
     all_transactions["type"] == "income", -all_transactions["amount"]
 )
 net_by_account = all_transactions.dropna(subset=["account_id"]).groupby("account_id")["signed_amount"].sum()
+transfer_in = (
+    all_transactions[all_transactions["type"] == "transfer"].groupby("to_account_id")["amount"].sum()
+)
+net_by_account = net_by_account.add(transfer_in, fill_value=0)
 account_balances: dict[int, float] = {
     row.id: row.initial_balance + net_by_account.get(row.id, 0.0) for row in accounts_df.itertuples()
 }
+
+untagged_net = all_transactions.loc[all_transactions["account_id"].isna(), "signed_amount"].sum()
+current_balance = settings[SETTING_INITIAL_CASH] + untagged_net + sum(account_balances.values())
+
+nisa_lifetime_total = (
+    all_transactions.loc[all_transactions["type"] == "investment", "amount"].sum()
+    + settings[SETTING_TSUMITATE_LIFETIME_BEFORE]
+    + settings[SETTING_GROWTH_LIFETIME_BEFORE]
+)
+total_assets = current_balance + nisa_lifetime_total
 
 
 # =============================================================================
@@ -153,8 +177,8 @@ with st.sidebar:
 
 st.markdown("### :material/payments: キャッシュフロー管理")
 
-tab_dashboard, tab_nisa, tab_budget, tab_accounts, tab_settings = st.tabs(
-    ["ダッシュボード", "NISA積立", "予算設定", "口座・カード", "初期設定"]
+tab_dashboard, tab_nisa, tab_budget, tab_accounts, tab_recurring, tab_settings = st.tabs(
+    ["ダッシュボード", "NISA積立", "予算設定", "口座・カード", "固定費", "初期設定"]
 )
 
 
@@ -166,8 +190,6 @@ with tab_dashboard:
     if all_transactions.empty:
         st.info("左のフォームから取引を追加してください。「初期設定」タブで現在の残高も登録できます。")
     else:
-        untagged_net = all_transactions.loc[all_transactions["account_id"].isna(), "signed_amount"].sum()
-        current_balance = settings[SETTING_INITIAL_CASH] + untagged_net + sum(account_balances.values())
         st.metric("現在の残高（初期設定 + 全口座 + 未設定分の取引合計）", f"¥{current_balance:,.0f}")
 
         if not accounts_df.empty:
@@ -193,6 +215,41 @@ with tab_dashboard:
             st.metric("支出合計（期間内）", f"¥{total_expense:,.0f}")
         with kpi_cols[2]:
             st.metric("NISA拠出額（期間内）", f"¥{total_investment:,.0f}")
+
+        if total_assets > 0:
+            st.markdown("### 全資産に対する支出割合")
+            asset_ratio_pct = total_expense / total_assets * 100
+            st.metric(
+                "期間内の支出が総資産に占める割合",
+                f"{asset_ratio_pct:.1f}%",
+                help=(
+                    f"総資産 ¥{total_assets:,.0f}（現金・預金残高 + NISA拠出累計額）に対する、"
+                    f"期間内の支出合計 ¥{total_expense:,.0f} の割合です。"
+                ),
+            )
+            by_category_pct = (
+                filtered[filtered["type"] == "expense"].groupby("category", as_index=False)["amount"].sum()
+            )
+            if not by_category_pct.empty:
+                by_category_pct["割合"] = by_category_pct["amount"] / total_assets * 100
+                by_category_pct = by_category_pct.sort_values("割合", ascending=False)
+                pct_chart = (
+                    alt.Chart(by_category_pct)
+                    .mark_bar()
+                    .encode(
+                        x=alt.X("割合:Q", title="総資産に対する割合(%)"),
+                        y=alt.Y("category:N", title=None, sort="-x"),
+                        tooltip=[
+                            alt.Tooltip("category:N", title="カテゴリ"),
+                            alt.Tooltip("amount:Q", title="金額", format=",.0f"),
+                            alt.Tooltip("割合:Q", title="総資産比(%)", format=".1f"),
+                        ],
+                    )
+                    .properties(height=250)
+                )
+                with st.container(border=True):
+                    st.markdown("**カテゴリ別支出の総資産に対する割合**")
+                    st.altair_chart(pct_chart)
 
         st.markdown("### 健全化アドバイス")
         for tip in generate_advice(all_transactions, budgets, settings):
@@ -304,16 +361,20 @@ with tab_dashboard:
 
         display_df = all_transactions.copy()
         display_df["type"] = display_df["type"].map(TYPE_LABELS)
-        account_name_map = {
-            row.id: f"{row.owner}: {row.name}" for row in accounts_df.itertuples()
-        }
         display_df["account"] = display_df["account_id"].map(account_name_map).fillna("未設定")
+        is_transfer = all_transactions["type"] == "transfer"
+        display_df.loc[is_transfer, "account"] = (
+            all_transactions.loc[is_transfer, "account_id"].map(account_name_map)
+            + " → "
+            + all_transactions.loc[is_transfer, "to_account_id"].map(account_name_map)
+        )
 
         event = st.dataframe(
             display_df,
             column_config={
                 "id": None,
                 "account_id": None,
+                "to_account_id": None,
                 "signed_amount": None,
                 "date": st.column_config.DateColumn("日付"),
                 "type": st.column_config.TextColumn("種別"),
@@ -579,3 +640,102 @@ with tab_accounts:
                     if st.button(":material/delete:", key=f"del_account_{row.id}", type="tertiary"):
                         delete_account(row.id)
                         st.rerun()
+
+    if len(accounts_df) >= 2:
+        st.markdown("#### 口座間の振替")
+        st.caption("現金を口座間で移動した場合はここから記録します。振替元の残高が減り、振替先の残高が増えます。")
+        with st.form("add_transfer", clear_on_submit=True):
+            transfer_cols = st.columns([1, 2, 2, 2, 2])
+            account_choices = [f"{row.owner}: {row.name}" for row in accounts_df.itertuples()]
+            with transfer_cols[0]:
+                transfer_date = st.date_input("日付", value=date.today(), key="transfer_date")
+            with transfer_cols[1]:
+                transfer_from_label = st.selectbox("振替元", options=account_choices, key="transfer_from")
+            with transfer_cols[2]:
+                transfer_to_label = st.selectbox("振替先", options=account_choices, key="transfer_to")
+            with transfer_cols[3]:
+                transfer_amount = st.number_input("金額", min_value=0, step=1000, key="transfer_amount")
+            with transfer_cols[4]:
+                transfer_memo = st.text_input(
+                    "メモ", placeholder="メモ（任意）", key="transfer_memo"
+                )
+
+            if st.form_submit_button("振替を記録", type="primary"):
+                account_id_by_label = {f"{row.owner}: {row.name}": row.id for row in accounts_df.itertuples()}
+                from_id = account_id_by_label[transfer_from_label]
+                to_id = account_id_by_label[transfer_to_label]
+                if from_id == to_id:
+                    st.error("振替元と振替先は異なる口座を選んでください。")
+                else:
+                    add_transfer(
+                        date=transfer_date.isoformat(),
+                        from_account_id=from_id,
+                        to_account_id=to_id,
+                        amount=transfer_amount,
+                        memo=transfer_memo,
+                    )
+                    st.rerun()
+    else:
+        st.info("口座を2つ以上登録すると、口座間の振替を記録できます。")
+
+
+# =============================================================================
+# Tab: 固定費
+# =============================================================================
+
+with tab_recurring:
+    st.caption(
+        "家賃やサブスクなど毎月決まった日に発生する固定費を登録すると、"
+        "その日を過ぎてからアプリを開いたタイミングで自動的に支出として記録され、指定した口座/カードの残高にも反映されます。"
+    )
+
+    with st.form("add_recurring", clear_on_submit=True):
+        rec_cols = st.columns([2, 1, 1, 2, 1])
+        with rec_cols[0]:
+            rec_name = st.text_input("名称", placeholder="例: 家賃、サブスク")
+        with rec_cols[1]:
+            rec_category = st.selectbox("カテゴリ", options=EXPENSE_CATEGORIES, key="rec_category")
+        with rec_cols[2]:
+            rec_amount = st.number_input("金額", min_value=0, step=100, key="rec_amount")
+        with rec_cols[3]:
+            rec_account_labels = {"未設定": None}
+            for row in accounts_df.itertuples():
+                rec_account_labels[f"{row.owner}: {row.name}（{ACCOUNT_KINDS[row.kind]}）"] = row.id
+            rec_account_label = st.selectbox(
+                "引き落とし口座/カード", options=list(rec_account_labels.keys()), key="rec_account"
+            )
+        with rec_cols[4]:
+            rec_day = st.number_input("引き落とし日", min_value=1, max_value=28, value=27, step=1, key="rec_day")
+
+        if st.form_submit_button("登録", type="primary"):
+            if rec_name.strip():
+                add_recurring_expense(
+                    rec_name.strip(),
+                    rec_category,
+                    rec_amount,
+                    rec_account_labels[rec_account_label],
+                    int(rec_day),
+                )
+                st.rerun()
+            else:
+                st.error("名称を入力してください。")
+
+    st.markdown("#### 登録済みの固定費")
+    if recurring_df.empty:
+        st.info("まだ固定費が登録されていません。")
+    else:
+        for row in recurring_df.itertuples():
+            row_cols = st.columns([2, 1, 1, 2, 1])
+            with row_cols[0]:
+                st.write(row.name)
+            with row_cols[1]:
+                st.write(row.category)
+            with row_cols[2]:
+                st.write(f"¥{row.amount:,.0f}")
+            with row_cols[3]:
+                account_label = account_name_map.get(row.account_id, "未設定")
+                st.write(f"{account_label}（毎月{row.day_of_month}日）")
+            with row_cols[4]:
+                if st.button(":material/delete:", key=f"del_recurring_{row.id}", type="tertiary"):
+                    delete_recurring_expense(row.id)
+                    st.rerun()

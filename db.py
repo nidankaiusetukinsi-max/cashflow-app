@@ -1,6 +1,7 @@
 """PostgreSQL (Neon) persistence for the cash flow tracker."""
 
 import functools
+from datetime import date as date_
 
 import pandas as pd
 import psycopg2
@@ -73,6 +74,32 @@ def get_connection() -> psycopg2.extensions.connection:
             "account_id INTEGER REFERENCES accounts(id) ON DELETE SET NULL"
         )
         cur.execute(
+            "ALTER TABLE transactions ADD COLUMN IF NOT EXISTS "
+            "to_account_id INTEGER REFERENCES accounts(id) ON DELETE SET NULL"
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS recurring_expenses (
+                id SERIAL PRIMARY KEY,
+                name TEXT NOT NULL,
+                category TEXT NOT NULL,
+                amount DOUBLE PRECISION NOT NULL,
+                account_id INTEGER REFERENCES accounts(id) ON DELETE SET NULL,
+                day_of_month INTEGER NOT NULL CHECK (day_of_month BETWEEN 1 AND 28)
+            )
+            """
+        )
+        cur.execute(
+            "ALTER TABLE transactions ADD COLUMN IF NOT EXISTS "
+            "recurring_expense_id INTEGER REFERENCES recurring_expenses(id) ON DELETE SET NULL"
+        )
+        # 既存DBの type CHECK 制約に 'transfer' を許可するよう毎回冪等に更新する。
+        cur.execute("ALTER TABLE transactions DROP CONSTRAINT IF EXISTS transactions_type_check")
+        cur.execute(
+            "ALTER TABLE transactions ADD CONSTRAINT transactions_type_check "
+            "CHECK (type IN ('income', 'expense', 'investment', 'transfer'))"
+        )
+        cur.execute(
             """
             CREATE TABLE IF NOT EXISTS budgets (
                 category TEXT PRIMARY KEY,
@@ -124,12 +151,24 @@ def add_transaction(
 def get_transactions() -> pd.DataFrame:
     conn = get_connection()
     df = pd.read_sql_query(
-        "SELECT id, date, type, category, amount, memo, account_id "
+        "SELECT id, date, type, category, amount, memo, account_id, to_account_id "
         "FROM transactions ORDER BY date DESC, id DESC",
         conn,
     )
     df["date"] = pd.to_datetime(df["date"])
     return df
+
+
+@_with_reconnect
+def add_transfer(date: str, from_account_id: int, to_account_id: int, amount: float, memo: str) -> None:
+    conn = get_connection()
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO transactions (date, type, category, amount, memo, account_id, to_account_id) "
+            "VALUES (%s, 'transfer', '振替', %s, %s, %s, %s)",
+            (date, amount, memo, from_account_id, to_account_id),
+        )
+    conn.commit()
 
 
 @_with_reconnect
@@ -221,3 +260,63 @@ def get_accounts() -> pd.DataFrame:
         conn,
     )
     return df
+
+
+@_with_reconnect
+def add_recurring_expense(
+    name: str, category: str, amount: float, account_id: int | None, day_of_month: int
+) -> None:
+    conn = get_connection()
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO recurring_expenses (name, category, amount, account_id, day_of_month) "
+            "VALUES (%s, %s, %s, %s, %s)",
+            (name, category, amount, account_id, day_of_month),
+        )
+    conn.commit()
+
+
+@_with_reconnect
+def delete_recurring_expense(recurring_id: int) -> None:
+    conn = get_connection()
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM recurring_expenses WHERE id = %s", (recurring_id,))
+    conn.commit()
+
+
+@_with_reconnect
+def get_recurring_expenses() -> pd.DataFrame:
+    conn = get_connection()
+    df = pd.read_sql_query(
+        "SELECT id, name, category, amount, account_id, day_of_month "
+        "FROM recurring_expenses ORDER BY day_of_month, id",
+        conn,
+    )
+    return df
+
+
+@_with_reconnect
+def apply_recurring_expenses() -> None:
+    """Insert this month's expense transaction for each recurring expense once its day has passed."""
+    conn = get_connection()
+    today = date_.today()
+    with conn.cursor() as cur:
+        cur.execute("SELECT id, name, category, amount, account_id, day_of_month FROM recurring_expenses")
+        rows = cur.fetchall()
+        for rec_id, name, category, amount, account_id, day_of_month in rows:
+            if today.day < day_of_month:
+                continue
+            cur.execute(
+                "SELECT 1 FROM transactions WHERE recurring_expense_id = %s "
+                "AND EXTRACT(YEAR FROM date) = %s AND EXTRACT(MONTH FROM date) = %s LIMIT 1",
+                (rec_id, today.year, today.month),
+            )
+            if cur.fetchone():
+                continue
+            applied_date = date_(today.year, today.month, day_of_month)
+            cur.execute(
+                "INSERT INTO transactions (date, type, category, amount, memo, account_id, recurring_expense_id) "
+                "VALUES (%s, 'expense', %s, %s, %s, %s, %s)",
+                (applied_date, category, amount, f"{name}（固定費自動引き落とし）", account_id, rec_id),
+            )
+    conn.commit()
