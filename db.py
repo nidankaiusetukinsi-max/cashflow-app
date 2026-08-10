@@ -31,6 +31,21 @@ SETTING_GROWTH_YTD_BEFORE = "growth_ytd_before"
 SETTING_ANNUAL_INCOME = "annual_income"
 SETTING_ANNUAL_EXPENSE_TARGET = "annual_expense_target"
 
+# ライフプラン（将来予測）関連のキー。
+SETTING_HUSBAND_BIRTH_YEAR = "husband_birth_year"
+SETTING_WIFE_BIRTH_YEAR = "wife_birth_year"
+SETTING_INFLATION_RATE = "inflation_rate"
+SETTING_MORTGAGE_MONTHLY_PAYMENT = "mortgage_monthly_payment"
+SETTING_MORTGAGE_PAYOFF_YEAR = "mortgage_payoff_year"
+SETTING_HUSBAND_RETIREMENT_AGE = "husband_retirement_age"
+SETTING_WIFE_RETIREMENT_AGE = "wife_retirement_age"
+SETTING_HUSBAND_PENSION_START_AGE = "husband_pension_start_age"
+SETTING_HUSBAND_PENSION_ANNUAL = "husband_pension_annual"
+SETTING_WIFE_PENSION_START_AGE = "wife_pension_start_age"
+SETTING_WIFE_PENSION_ANNUAL = "wife_pension_annual"
+SETTING_CHILDCARE_ANNUAL_COST = "childcare_annual_cost"
+SETTING_CHILDCARE_END_AGE = "childcare_end_age"
+
 SETTINGS_KEYS = [
     SETTING_INITIAL_CASH,
     SETTING_TSUMITATE_LIFETIME_BEFORE,
@@ -39,6 +54,19 @@ SETTINGS_KEYS = [
     SETTING_GROWTH_YTD_BEFORE,
     SETTING_ANNUAL_INCOME,
     SETTING_ANNUAL_EXPENSE_TARGET,
+    SETTING_HUSBAND_BIRTH_YEAR,
+    SETTING_WIFE_BIRTH_YEAR,
+    SETTING_INFLATION_RATE,
+    SETTING_MORTGAGE_MONTHLY_PAYMENT,
+    SETTING_MORTGAGE_PAYOFF_YEAR,
+    SETTING_HUSBAND_RETIREMENT_AGE,
+    SETTING_WIFE_RETIREMENT_AGE,
+    SETTING_HUSBAND_PENSION_START_AGE,
+    SETTING_HUSBAND_PENSION_ANNUAL,
+    SETTING_WIFE_PENSION_START_AGE,
+    SETTING_WIFE_PENSION_ANNUAL,
+    SETTING_CHILDCARE_ANNUAL_COST,
+    SETTING_CHILDCARE_END_AGE,
 ]
 
 
@@ -112,6 +140,15 @@ def get_connection() -> psycopg2.extensions.connection:
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
                 value DOUBLE PRECISION NOT NULL
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS children (
+                id SERIAL PRIMARY KEY,
+                name TEXT,
+                birth_year INTEGER NOT NULL
             )
             """
         )
@@ -320,3 +357,28 @@ def apply_recurring_expenses() -> None:
                 (applied_date, category, amount, f"{name}（固定費自動引き落とし）", account_id, rec_id),
             )
     conn.commit()
+
+
+@_with_reconnect
+def add_child(name: str | None, birth_year: int) -> None:
+    conn = get_connection()
+    with conn.cursor() as cur:
+        cur.execute("INSERT INTO children (name, birth_year) VALUES (%s, %s)", (name, birth_year))
+    conn.commit()
+
+
+@_with_reconnect
+def delete_child(child_id: int) -> None:
+    conn = get_connection()
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM children WHERE id = %s", (child_id,))
+    conn.commit()
+
+
+@_with_reconnect
+def get_children() -> pd.DataFrame:
+    conn = get_connection()
+    df = pd.read_sql_query(
+        "SELECT id, name, birth_year FROM children ORDER BY birth_year DESC, id", conn
+    )
+    return df

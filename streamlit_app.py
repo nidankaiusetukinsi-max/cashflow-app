@@ -19,28 +19,45 @@ from db import (
     OWNERS,
     SETTING_ANNUAL_EXPENSE_TARGET,
     SETTING_ANNUAL_INCOME,
+    SETTING_CHILDCARE_ANNUAL_COST,
+    SETTING_CHILDCARE_END_AGE,
     SETTING_GROWTH_LIFETIME_BEFORE,
     SETTING_GROWTH_YTD_BEFORE,
+    SETTING_HUSBAND_BIRTH_YEAR,
+    SETTING_HUSBAND_PENSION_ANNUAL,
+    SETTING_HUSBAND_PENSION_START_AGE,
+    SETTING_HUSBAND_RETIREMENT_AGE,
+    SETTING_INFLATION_RATE,
     SETTING_INITIAL_CASH,
+    SETTING_MORTGAGE_MONTHLY_PAYMENT,
+    SETTING_MORTGAGE_PAYOFF_YEAR,
     SETTING_TSUMITATE_LIFETIME_BEFORE,
     SETTING_TSUMITATE_YTD_BEFORE,
+    SETTING_WIFE_BIRTH_YEAR,
+    SETTING_WIFE_PENSION_ANNUAL,
+    SETTING_WIFE_PENSION_START_AGE,
+    SETTING_WIFE_RETIREMENT_AGE,
     add_account,
+    add_child,
     add_recurring_expense,
     add_transaction,
     add_transfer,
     apply_recurring_expenses,
     delete_account,
     delete_budget,
+    delete_child,
     delete_recurring_expense,
     delete_transactions,
     get_accounts,
     get_budgets,
+    get_children,
     get_recurring_expenses,
     get_settings,
     get_transactions,
     set_budget,
     set_setting,
 )
+from forecast import build_childcare_forecast, build_expense_forecast, build_life_events
 
 st.set_page_config(
     page_title="キャッシュフロー管理",
@@ -177,8 +194,8 @@ with st.sidebar:
 
 st.markdown("### :material/payments: キャッシュフロー管理")
 
-tab_dashboard, tab_nisa, tab_budget, tab_accounts, tab_recurring, tab_settings = st.tabs(
-    ["ダッシュボード", "NISA積立", "予算設定", "口座・カード", "固定費", "初期設定"]
+tab_dashboard, tab_nisa, tab_budget, tab_accounts, tab_recurring, tab_lifeplan, tab_settings = st.tabs(
+    ["ダッシュボード", "NISA積立", "予算設定", "口座・カード", "固定費", "ライフプラン", "初期設定"]
 )
 
 
@@ -739,3 +756,270 @@ with tab_recurring:
                 if st.button(":material/delete:", key=f"del_recurring_{row.id}", type="tertiary"):
                     delete_recurring_expense(row.id)
                     st.rerun()
+
+
+# =============================================================================
+# Tab: ライフプラン
+# =============================================================================
+
+with tab_lifeplan:
+    st.caption(
+        "物価上昇率・住宅ローン・定年・年金・育児費用を設定すると、将来の支出や年金収入の見通しを概算でグラフ表示します。"
+        "あくまで簡易なシミュレーションです。"
+    )
+
+    with st.form("lifeplan_settings"):
+        st.markdown("##### 基本情報")
+        base_cols = st.columns(3)
+        with base_cols[0]:
+            husband_birth_year_setting = settings[SETTING_HUSBAND_BIRTH_YEAR]
+            husband_age_default = (
+                int(date.today().year - husband_birth_year_setting) if husband_birth_year_setting > 0 else 35
+            )
+            husband_age = st.number_input(
+                "夫の現在の年齢", min_value=0, max_value=120, step=1, value=husband_age_default
+            )
+        with base_cols[1]:
+            wife_birth_year_setting = settings[SETTING_WIFE_BIRTH_YEAR]
+            wife_age_default = (
+                int(date.today().year - wife_birth_year_setting) if wife_birth_year_setting > 0 else 35
+            )
+            wife_age = st.number_input(
+                "嫁の現在の年齢", min_value=0, max_value=120, step=1, value=wife_age_default
+            )
+        with base_cols[2]:
+            inflation_rate = st.number_input(
+                "物価上昇率（年率 %）",
+                min_value=0.0,
+                max_value=20.0,
+                step=0.1,
+                value=float(settings[SETTING_INFLATION_RATE]),
+            )
+
+        st.markdown("##### 住宅ローン")
+        mortgage_cols = st.columns(2)
+        with mortgage_cols[0]:
+            mortgage_monthly = st.number_input(
+                "月々の返済額",
+                min_value=0,
+                step=1000,
+                value=int(settings[SETTING_MORTGAGE_MONTHLY_PAYMENT]),
+            )
+        with mortgage_cols[1]:
+            mortgage_payoff_year = st.number_input(
+                "完済年（西暦）",
+                min_value=0,
+                max_value=2200,
+                step=1,
+                value=int(settings[SETTING_MORTGAGE_PAYOFF_YEAR]),
+                help="0のままにすると住宅ローンなしとして扱われます。",
+            )
+
+        st.markdown("##### 定年")
+        retire_cols = st.columns(2)
+        with retire_cols[0]:
+            husband_retirement_age = st.number_input(
+                "夫の定年年齢",
+                min_value=0,
+                max_value=100,
+                step=1,
+                value=int(settings[SETTING_HUSBAND_RETIREMENT_AGE]) or 65,
+            )
+        with retire_cols[1]:
+            wife_retirement_age = st.number_input(
+                "嫁の定年年齢",
+                min_value=0,
+                max_value=100,
+                step=1,
+                value=int(settings[SETTING_WIFE_RETIREMENT_AGE]) or 65,
+            )
+
+        st.markdown("##### 年金")
+        pension_cols = st.columns(4)
+        with pension_cols[0]:
+            husband_pension_start_age = st.number_input(
+                "夫の受給開始年齢",
+                min_value=0,
+                max_value=100,
+                step=1,
+                value=int(settings[SETTING_HUSBAND_PENSION_START_AGE]) or 65,
+            )
+        with pension_cols[1]:
+            husband_pension_annual = st.number_input(
+                "夫の年間受給見込み額",
+                min_value=0,
+                step=10000,
+                value=int(settings[SETTING_HUSBAND_PENSION_ANNUAL]),
+            )
+        with pension_cols[2]:
+            wife_pension_start_age = st.number_input(
+                "嫁の受給開始年齢",
+                min_value=0,
+                max_value=100,
+                step=1,
+                value=int(settings[SETTING_WIFE_PENSION_START_AGE]) or 65,
+            )
+        with pension_cols[3]:
+            wife_pension_annual = st.number_input(
+                "嫁の年間受給見込み額",
+                min_value=0,
+                step=10000,
+                value=int(settings[SETTING_WIFE_PENSION_ANNUAL]),
+            )
+
+        st.markdown("##### 育児費用の目安")
+        st.caption(
+            "子育て費用（教育費込み）の全国平均・中央値は各種調査で年齢により年間およそ50万〜200万円程度とされています。"
+            "実態に合わせて調整してください。"
+        )
+        childcare_cols = st.columns(2)
+        with childcare_cols[0]:
+            childcare_annual_cost = st.number_input(
+                "子ども1人あたりの年間費用目安",
+                min_value=0,
+                step=10000,
+                value=int(settings[SETTING_CHILDCARE_ANNUAL_COST]) or 1_000_000,
+            )
+        with childcare_cols[1]:
+            childcare_end_age = st.number_input(
+                "費用がかかる年齢の上限（目安: 大学卒業=22歳）",
+                min_value=0,
+                max_value=30,
+                step=1,
+                value=int(settings[SETTING_CHILDCARE_END_AGE]) or 22,
+            )
+
+        if st.form_submit_button("ライフプラン設定を保存", type="primary"):
+            set_setting(SETTING_HUSBAND_BIRTH_YEAR, date.today().year - husband_age)
+            set_setting(SETTING_WIFE_BIRTH_YEAR, date.today().year - wife_age)
+            set_setting(SETTING_INFLATION_RATE, inflation_rate)
+            set_setting(SETTING_MORTGAGE_MONTHLY_PAYMENT, mortgage_monthly)
+            set_setting(SETTING_MORTGAGE_PAYOFF_YEAR, mortgage_payoff_year)
+            set_setting(SETTING_HUSBAND_RETIREMENT_AGE, husband_retirement_age)
+            set_setting(SETTING_WIFE_RETIREMENT_AGE, wife_retirement_age)
+            set_setting(SETTING_HUSBAND_PENSION_START_AGE, husband_pension_start_age)
+            set_setting(SETTING_HUSBAND_PENSION_ANNUAL, husband_pension_annual)
+            set_setting(SETTING_WIFE_PENSION_START_AGE, wife_pension_start_age)
+            set_setting(SETTING_WIFE_PENSION_ANNUAL, wife_pension_annual)
+            set_setting(SETTING_CHILDCARE_ANNUAL_COST, childcare_annual_cost)
+            set_setting(SETTING_CHILDCARE_END_AGE, childcare_end_age)
+            st.toast("ライフプラン設定を保存しました。", icon=":material/check_circle:")
+            st.rerun()
+
+    st.markdown("##### 子どもの登録")
+    with st.form("add_child", clear_on_submit=True):
+        child_cols = st.columns([2, 1, 1])
+        with child_cols[0]:
+            child_name = st.text_input("名前（任意）", placeholder="例: 長男")
+        with child_cols[1]:
+            child_age = st.number_input("現在の年齢", min_value=0, max_value=30, step=1, key="child_age")
+        with child_cols[2]:
+            st.markdown("&nbsp;")
+            if st.form_submit_button("追加", type="primary"):
+                add_child(child_name.strip() or None, date.today().year - child_age)
+                st.rerun()
+
+    children_df = get_children()
+    if not children_df.empty:
+        for row in children_df.itertuples():
+            row_cols = st.columns([2, 1, 1])
+            with row_cols[0]:
+                st.write(row.name if pd.notna(row.name) else "(名前未設定)")
+            with row_cols[1]:
+                st.write(f"{date.today().year - row.birth_year}歳")
+            with row_cols[2]:
+                if st.button(":material/delete:", key=f"del_child_{row.id}", type="tertiary"):
+                    delete_child(row.id)
+                    st.rerun()
+
+    st.markdown("---")
+    st.markdown("#### 将来の支出・年金収入シミュレーション")
+
+    if settings[SETTING_ANNUAL_EXPENSE_TARGET] > 0:
+        base_annual_expense = settings[SETTING_ANNUAL_EXPENSE_TARGET]
+    else:
+        recent_cutoff = pd.Timestamp(date.today()) - pd.Timedelta(days=365)
+        base_annual_expense = all_transactions.loc[
+            (all_transactions["type"] == "expense") & (all_transactions["date"] >= recent_cutoff), "amount"
+        ].sum()
+
+    if base_annual_expense <= 0:
+        st.info("支出データ、または「初期設定」タブの年間目標支出を登録すると、将来の支出シミュレーションが表示されます。")
+    else:
+        forecast_df = build_expense_forecast(base_annual_expense, settings)
+        events = build_life_events(settings)
+
+        st.caption(
+            f"現在の年間支出（直近1年の実績、未登録の場合は年間目標支出）¥{base_annual_expense:,.0f} を基準に、"
+            "物価上昇率で将来の金額に換算しています。住宅ローンは完済年より後、月々の返済額×12を差し引いています。"
+        )
+
+        long_df = forecast_df.melt(
+            id_vars=["year"],
+            value_vars=["projected_expense", "pension_income"],
+            var_name="系列",
+            value_name="金額",
+        )
+        long_df["系列"] = long_df["系列"].map({"projected_expense": "予測支出", "pension_income": "年金収入"})
+
+        base_chart = (
+            alt.Chart(long_df)
+            .mark_line()
+            .encode(
+                x=alt.X("year:Q", title="年", axis=alt.Axis(format="d")),
+                y=alt.Y("金額:Q", title=None),
+                color=alt.Color("系列:N", title=None, legend=alt.Legend(orient="bottom")),
+                tooltip=[
+                    alt.Tooltip("year:Q", title="年", format="d"),
+                    alt.Tooltip("系列:N", title="系列"),
+                    alt.Tooltip("金額:Q", title="金額", format=",.0f"),
+                ],
+            )
+        )
+
+        layers = [base_chart]
+        if events:
+            events_df = pd.DataFrame(events)
+            rule_chart = (
+                alt.Chart(events_df)
+                .mark_rule(strokeDash=[4, 4], color="gray")
+                .encode(
+                    x=alt.X("year:Q", axis=alt.Axis(format="d")),
+                    tooltip=[
+                        alt.Tooltip("label:N", title="イベント"),
+                        alt.Tooltip("year:Q", title="年", format="d"),
+                    ],
+                )
+            )
+            layers.append(rule_chart)
+
+        combined_chart = alt.layer(*layers).properties(height=350)
+        with st.container(border=True):
+            st.altair_chart(combined_chart)
+
+        if events:
+            st.caption(" / ".join(f"{e['label']}: {e['year']}年" for e in events))
+
+    st.markdown("#### 育児費用の予測（全国平均・中央値目安ベース）")
+    if children_df.empty:
+        st.info("子どもを登録すると、育児費用の予測グラフが表示されます。")
+    else:
+        childcare_forecast_df = build_childcare_forecast(settings, children_df)
+        if childcare_forecast_df.empty:
+            st.info("設定された年齢上限の範囲では、対象になる育児費用がありません。")
+        else:
+            childcare_chart = (
+                alt.Chart(childcare_forecast_df)
+                .mark_bar()
+                .encode(
+                    x=alt.X("year:O", title="年"),
+                    y=alt.Y("childcare_cost:Q", title=None),
+                    tooltip=[
+                        alt.Tooltip("year:O", title="年"),
+                        alt.Tooltip("childcare_cost:Q", title="育児費用目安", format=",.0f"),
+                    ],
+                )
+                .properties(height=300)
+            )
+            with st.container(border=True):
+                st.altair_chart(childcare_chart)
