@@ -1,5 +1,7 @@
 """PostgreSQL (Neon) persistence for the cash flow tracker."""
 
+import functools
+
 import pandas as pd
 import psycopg2
 import psycopg2.extensions
@@ -68,6 +70,21 @@ def get_connection() -> psycopg2.extensions.connection:
     return conn
 
 
+def _with_reconnect(func):
+    """Retry once with a fresh connection if Neon closed the cached one while idle."""
+
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except (psycopg2.OperationalError, psycopg2.InterfaceError):
+            get_connection.clear()
+            return func(*args, **kwargs)
+
+    return wrapper
+
+
+@_with_reconnect
 def add_transaction(date: str, type_: str, category: str, amount: float, memo: str) -> None:
     conn = get_connection()
     with conn.cursor() as cur:
@@ -78,6 +95,7 @@ def add_transaction(date: str, type_: str, category: str, amount: float, memo: s
     conn.commit()
 
 
+@_with_reconnect
 def get_transactions() -> pd.DataFrame:
     conn = get_connection()
     df = pd.read_sql_query(
@@ -88,6 +106,7 @@ def get_transactions() -> pd.DataFrame:
     return df
 
 
+@_with_reconnect
 def delete_transactions(ids: list[int]) -> None:
     if not ids:
         return
@@ -98,6 +117,7 @@ def delete_transactions(ids: list[int]) -> None:
     conn.commit()
 
 
+@_with_reconnect
 def set_budget(category: str, monthly_limit: float) -> None:
     conn = get_connection()
     with conn.cursor() as cur:
@@ -109,6 +129,7 @@ def set_budget(category: str, monthly_limit: float) -> None:
     conn.commit()
 
 
+@_with_reconnect
 def delete_budget(category: str) -> None:
     conn = get_connection()
     with conn.cursor() as cur:
@@ -116,6 +137,7 @@ def delete_budget(category: str) -> None:
     conn.commit()
 
 
+@_with_reconnect
 def get_budgets() -> dict[str, float]:
     conn = get_connection()
     with conn.cursor() as cur:
@@ -124,6 +146,7 @@ def get_budgets() -> dict[str, float]:
     return dict(rows)
 
 
+@_with_reconnect
 def set_setting(key: str, value: float) -> None:
     conn = get_connection()
     with conn.cursor() as cur:
@@ -135,6 +158,7 @@ def set_setting(key: str, value: float) -> None:
     conn.commit()
 
 
+@_with_reconnect
 def get_settings() -> dict[str, float]:
     conn = get_connection()
     with conn.cursor() as cur:
