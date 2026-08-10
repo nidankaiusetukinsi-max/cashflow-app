@@ -36,6 +36,30 @@ st.set_page_config(
     layout="wide",
 )
 
+
+def check_password() -> bool:
+    """Show a password gate; return True once the correct password is entered."""
+
+    def password_entered() -> None:
+        if st.session_state["password_input"] == st.secrets["APP_PASSWORD"]:
+            st.session_state["password_correct"] = True
+            del st.session_state["password_input"]
+        else:
+            st.session_state["password_correct"] = False
+
+    if st.session_state.get("password_correct"):
+        return True
+
+    st.text_input("パスワード", type="password", on_change=password_entered, key="password_input")
+    if st.session_state.get("password_correct") is False:
+        st.error("パスワードが違います。")
+    return False
+
+
+if not check_password():
+    st.stop()
+
+
 TIME_RANGES = ["1ヶ月", "6ヶ月", "1年", "今年", "すべて"]
 TYPE_LABELS = {"income": "収入", "expense": "支出", "investment": "投資(NISA)"}
 
