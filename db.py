@@ -7,9 +7,12 @@ import psycopg2
 import psycopg2.extensions
 import streamlit as st
 
-INCOME_CATEGORIES = ["給与", "副業", "投資", "その他収入"]
+INCOME_CATEGORIES = ["副業", "投資", "その他収入"]
 EXPENSE_CATEGORIES = ["食費", "住居", "光熱費", "交通", "娯楽", "医療", "育児", "その他支出"]
 NISA_CATEGORIES = ["つみたて投資枠", "成長投資枠"]
+
+OWNERS = ["夫", "嫁"]
+ACCOUNT_KINDS = {"bank": "銀行口座", "card": "クレジットカード"}
 
 # 2024年開始の新NISA制度の上限額。生涯枠は簿価残高方式（売却で枠が復活する）だが、
 # ここでは単純に「これまでの拠出累計」で消化率を近似する。
@@ -24,7 +27,7 @@ SETTING_TSUMITATE_LIFETIME_BEFORE = "tsumitate_lifetime_before"
 SETTING_GROWTH_LIFETIME_BEFORE = "growth_lifetime_before"
 SETTING_TSUMITATE_YTD_BEFORE = "tsumitate_ytd_before"
 SETTING_GROWTH_YTD_BEFORE = "growth_ytd_before"
-SETTING_ANNUAL_INCOME_TARGET = "annual_income_target"
+SETTING_ANNUAL_INCOME = "annual_income"
 SETTING_ANNUAL_EXPENSE_TARGET = "annual_expense_target"
 
 SETTINGS_KEYS = [
@@ -33,7 +36,7 @@ SETTINGS_KEYS = [
     SETTING_GROWTH_LIFETIME_BEFORE,
     SETTING_TSUMITATE_YTD_BEFORE,
     SETTING_GROWTH_YTD_BEFORE,
-    SETTING_ANNUAL_INCOME_TARGET,
+    SETTING_ANNUAL_INCOME,
     SETTING_ANNUAL_EXPENSE_TARGET,
 ]
 
@@ -42,6 +45,17 @@ SETTINGS_KEYS = [
 def get_connection() -> psycopg2.extensions.connection:
     conn = psycopg2.connect(st.secrets["DATABASE_URL"])
     with conn.cursor() as cur:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS accounts (
+                id SERIAL PRIMARY KEY,
+                owner TEXT NOT NULL CHECK (owner IN ('夫', '嫁')),
+                name TEXT NOT NULL,
+                kind TEXT NOT NULL CHECK (kind IN ('bank', 'card')),
+                initial_balance DOUBLE PRECISION NOT NULL DEFAULT 0
+            )
+            """
+        )
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS transactions (
@@ -53,6 +67,10 @@ def get_connection() -> psycopg2.extensions.connection:
                 memo TEXT
             )
             """
+        )
+        cur.execute(
+            "ALTER TABLE transactions ADD COLUMN IF NOT EXISTS "
+            "account_id INTEGER REFERENCES accounts(id) ON DELETE SET NULL"
         )
         cur.execute(
             """
@@ -89,12 +107,15 @@ def _with_reconnect(func):
 
 
 @_with_reconnect
-def add_transaction(date: str, type_: str, category: str, amount: float, memo: str) -> None:
+def add_transaction(
+    date: str, type_: str, category: str, amount: float, memo: str, account_id: int | None = None
+) -> None:
     conn = get_connection()
     with conn.cursor() as cur:
         cur.execute(
-            "INSERT INTO transactions (date, type, category, amount, memo) VALUES (%s, %s, %s, %s, %s)",
-            (date, type_, category, amount, memo),
+            "INSERT INTO transactions (date, type, category, amount, memo, account_id) "
+            "VALUES (%s, %s, %s, %s, %s, %s)",
+            (date, type_, category, amount, memo, account_id),
         )
     conn.commit()
 
@@ -103,7 +124,8 @@ def add_transaction(date: str, type_: str, category: str, amount: float, memo: s
 def get_transactions() -> pd.DataFrame:
     conn = get_connection()
     df = pd.read_sql_query(
-        "SELECT id, date, type, category, amount, memo FROM transactions ORDER BY date DESC, id DESC",
+        "SELECT id, date, type, category, amount, memo, account_id "
+        "FROM transactions ORDER BY date DESC, id DESC",
         conn,
     )
     df["date"] = pd.to_datetime(df["date"])
@@ -170,3 +192,32 @@ def get_settings() -> dict[str, float]:
         rows = cur.fetchall()
     values = dict(rows)
     return {key: values.get(key, 0.0) for key in SETTINGS_KEYS}
+
+
+@_with_reconnect
+def add_account(owner: str, name: str, kind: str, initial_balance: float) -> None:
+    conn = get_connection()
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO accounts (owner, name, kind, initial_balance) VALUES (%s, %s, %s, %s)",
+            (owner, name, kind, initial_balance),
+        )
+    conn.commit()
+
+
+@_with_reconnect
+def delete_account(account_id: int) -> None:
+    conn = get_connection()
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM accounts WHERE id = %s", (account_id,))
+    conn.commit()
+
+
+@_with_reconnect
+def get_accounts() -> pd.DataFrame:
+    conn = get_connection()
+    df = pd.read_sql_query(
+        "SELECT id, owner, name, kind, initial_balance FROM accounts ORDER BY owner, id",
+        conn,
+    )
+    return df

@@ -8,6 +8,7 @@ import pandas as pd
 import streamlit as st
 from advice import generate_advice
 from db import (
+    ACCOUNT_KINDS,
     EXPENSE_CATEGORIES,
     INCOME_CATEGORIES,
     NISA_CATEGORIES,
@@ -15,16 +16,20 @@ from db import (
     NISA_GROWTH_LIFETIME_LIMIT,
     NISA_LIFETIME_LIMIT,
     NISA_TSUMITATE_ANNUAL_LIMIT,
+    OWNERS,
     SETTING_ANNUAL_EXPENSE_TARGET,
-    SETTING_ANNUAL_INCOME_TARGET,
+    SETTING_ANNUAL_INCOME,
     SETTING_GROWTH_LIFETIME_BEFORE,
     SETTING_GROWTH_YTD_BEFORE,
     SETTING_INITIAL_CASH,
     SETTING_TSUMITATE_LIFETIME_BEFORE,
     SETTING_TSUMITATE_YTD_BEFORE,
+    add_account,
     add_transaction,
+    delete_account,
     delete_budget,
     delete_transactions,
+    get_accounts,
     get_budgets,
     get_settings,
     get_transactions,
@@ -87,6 +92,24 @@ def filter_by_time_range(df: pd.DataFrame, time_range: str) -> pd.DataFrame:
 
 
 # =============================================================================
+# Data
+# =============================================================================
+
+all_transactions = get_transactions()
+budgets = get_budgets()
+settings = get_settings()
+accounts_df = get_accounts()
+
+all_transactions["signed_amount"] = all_transactions["amount"].where(
+    all_transactions["type"] == "income", -all_transactions["amount"]
+)
+net_by_account = all_transactions.dropna(subset=["account_id"]).groupby("account_id")["signed_amount"].sum()
+account_balances: dict[int, float] = {
+    row.id: row.initial_balance + net_by_account.get(row.id, 0.0) for row in accounts_df.itertuples()
+}
+
+
+# =============================================================================
 # Sidebar: new transaction form
 # =============================================================================
 
@@ -110,6 +133,11 @@ with st.sidebar:
         entry_amount = st.number_input("金額", min_value=0, step=100)
         entry_memo = st.text_input("メモ", label_visibility="collapsed", placeholder="メモ（任意）")
 
+        account_labels = {"未設定": None}
+        for row in accounts_df.itertuples():
+            account_labels[f"{row.owner}: {row.name}（{ACCOUNT_KINDS[row.kind]}）"] = row.id
+        entry_account_label = st.selectbox("口座/カード", options=list(account_labels.keys()))
+
         if st.form_submit_button("追加", type="primary"):
             type_map = {"収入": "income", "支出": "expense", "投資(NISA)": "investment"}
             add_transaction(
@@ -118,22 +146,15 @@ with st.sidebar:
                 category=entry_category,
                 amount=entry_amount,
                 memo=entry_memo,
+                account_id=account_labels[entry_account_label],
             )
             st.rerun()
 
 
-# =============================================================================
-# Data
-# =============================================================================
-
 st.markdown("### :material/payments: キャッシュフロー管理")
 
-all_transactions = get_transactions()
-budgets = get_budgets()
-settings = get_settings()
-
-tab_dashboard, tab_nisa, tab_budget, tab_settings = st.tabs(
-    ["ダッシュボード", "NISA積立", "予算設定", "初期設定"]
+tab_dashboard, tab_nisa, tab_budget, tab_accounts, tab_settings = st.tabs(
+    ["ダッシュボード", "NISA積立", "予算設定", "口座・カード", "初期設定"]
 )
 
 
@@ -145,13 +166,16 @@ with tab_dashboard:
     if all_transactions.empty:
         st.info("左のフォームから取引を追加してください。「初期設定」タブで現在の残高も登録できます。")
     else:
-        current_net = (
-            all_transactions.loc[all_transactions["type"] == "income", "amount"].sum()
-            - all_transactions.loc[all_transactions["type"] == "expense", "amount"].sum()
-            - all_transactions.loc[all_transactions["type"] == "investment", "amount"].sum()
-        )
-        current_balance = settings[SETTING_INITIAL_CASH] + current_net
-        st.metric("現在の残高（初期設定 + 記録した取引の合計）", f"¥{current_balance:,.0f}")
+        untagged_net = all_transactions.loc[all_transactions["account_id"].isna(), "signed_amount"].sum()
+        current_balance = settings[SETTING_INITIAL_CASH] + untagged_net + sum(account_balances.values())
+        st.metric("現在の残高（初期設定 + 全口座 + 未設定分の取引合計）", f"¥{current_balance:,.0f}")
+
+        if not accounts_df.empty:
+            st.markdown("**口座・カード別残高**")
+            balance_cols = st.columns(min(len(accounts_df), 4) or 1)
+            for i, row in enumerate(accounts_df.itertuples()):
+                with balance_cols[i % len(balance_cols)]:
+                    st.metric(f"{row.owner}: {row.name}", f"¥{account_balances[row.id]:,.0f}")
 
         time_range = st.segmented_control(
             "期間", options=TIME_RANGES, default="すべて", key="dashboard_time_range"
@@ -174,81 +198,54 @@ with tab_dashboard:
         for tip in generate_advice(all_transactions, budgets, settings):
             st.info(tip, icon=":material/lightbulb:")
 
-        income_target = settings[SETTING_ANNUAL_INCOME_TARGET]
         expense_target = settings[SETTING_ANNUAL_EXPENSE_TARGET]
-        if income_target > 0 or expense_target > 0:
-            st.markdown("### 年間目標との比較")
+        if expense_target > 0:
+            st.markdown("### 年間支出目標との比較")
             this_year_num = date.today().year
             elapsed_ratio = date.today().timetuple().tm_yday / 365
             this_year_all = all_transactions[all_transactions["date"].dt.year == this_year_num]
 
-            target_cols = st.columns(2)
-            if income_target > 0:
-                income_ytd = this_year_all.loc[this_year_all["type"] == "income", "amount"].sum()
-                income_pace = income_target * elapsed_ratio
-                with target_cols[0]:
-                    st.metric(
-                        "今年の収入実績",
-                        f"¥{income_ytd:,.0f}",
-                        delta=f"¥{income_ytd - income_pace:,.0f}（対目標ペース）",
-                        help=f"年間目標 ¥{income_target:,.0f} に対し、経過{elapsed_ratio * 100:.0f}%時点の目標ペースは ¥{income_pace:,.0f}",
-                    )
-            if expense_target > 0:
-                expense_ytd = this_year_all.loc[this_year_all["type"] == "expense", "amount"].sum()
-                expense_pace = expense_target * elapsed_ratio
-                with target_cols[1]:
-                    st.metric(
-                        "今年の支出実績",
-                        f"¥{expense_ytd:,.0f}",
-                        delta=f"¥{expense_ytd - expense_pace:,.0f}（対目標ペース）",
-                        delta_color="inverse",
-                        help=f"年間目標 ¥{expense_target:,.0f} に対し、経過{elapsed_ratio * 100:.0f}%時点の目標ペースは ¥{expense_pace:,.0f}",
-                    )
+            expense_ytd = this_year_all.loc[this_year_all["type"] == "expense", "amount"].sum()
+            expense_pace = expense_target * elapsed_ratio
+            st.metric(
+                "今年の支出実績",
+                f"¥{expense_ytd:,.0f}",
+                delta=f"¥{expense_ytd - expense_pace:,.0f}（対目標ペース）",
+                delta_color="inverse",
+                help=f"年間目標 ¥{expense_target:,.0f} に対し、経過{elapsed_ratio * 100:.0f}%時点の目標ペースは ¥{expense_pace:,.0f}",
+            )
 
-            target_chart_cols = st.columns(2)
             year_start = pd.Timestamp(date(this_year_num, 1, 1))
             year_end = pd.Timestamp(date(this_year_num, 12, 31))
-
-            def render_target_progress_chart(type_: str, target_annual: float) -> alt.Chart:
-                type_df = this_year_all[this_year_all["type"] == type_]
-                actual = type_df.groupby("date", as_index=False)["amount"].sum().sort_values("date")
-                actual["累計"] = actual["amount"].cumsum()
-                actual_series = pd.DataFrame(
-                    {"日付": actual["date"], "系列": "実績", "金額": actual["累計"]}
+            type_df = this_year_all[this_year_all["type"] == "expense"]
+            actual = type_df.groupby("date", as_index=False)["amount"].sum().sort_values("date")
+            actual["累計"] = actual["amount"].cumsum()
+            actual_series = pd.DataFrame({"日付": actual["date"], "系列": "実績", "金額": actual["累計"]})
+            target_series = pd.DataFrame(
+                {"日付": [year_start, year_end], "系列": "目標ペース", "金額": [0, expense_target]}
+            )
+            combined = pd.concat([actual_series, target_series], ignore_index=True)
+            expense_target_chart = (
+                alt.Chart(combined)
+                .mark_line()
+                .encode(
+                    x=alt.X("日付:T", title=None),
+                    y=alt.Y("金額:Q", title=None),
+                    color=alt.Color("系列:N", title=None, legend=alt.Legend(orient="bottom")),
+                    strokeDash=alt.condition(
+                        alt.datum.系列 == "目標ペース", alt.value([5, 5]), alt.value([0])
+                    ),
+                    tooltip=[
+                        alt.Tooltip("日付:T", title="日付", format="%Y-%m-%d"),
+                        alt.Tooltip("系列:N", title="系列"),
+                        alt.Tooltip("金額:Q", title="金額", format=",.0f"),
+                    ],
                 )
-                target_series = pd.DataFrame(
-                    {"日付": [year_start, year_end], "系列": "目標ペース", "金額": [0, target_annual]}
-                )
-                combined = pd.concat([actual_series, target_series], ignore_index=True)
-                return (
-                    alt.Chart(combined)
-                    .mark_line()
-                    .encode(
-                        x=alt.X("日付:T", title=None),
-                        y=alt.Y("金額:Q", title=None),
-                        color=alt.Color("系列:N", title=None, legend=alt.Legend(orient="bottom")),
-                        strokeDash=alt.condition(
-                            alt.datum.系列 == "目標ペース", alt.value([5, 5]), alt.value([0])
-                        ),
-                        tooltip=[
-                            alt.Tooltip("日付:T", title="日付", format="%Y-%m-%d"),
-                            alt.Tooltip("系列:N", title="系列"),
-                            alt.Tooltip("金額:Q", title="金額", format=",.0f"),
-                        ],
-                    )
-                    .properties(height=300)
-                )
-
-            if income_target > 0:
-                with target_chart_cols[0]:
-                    with st.container(border=True):
-                        st.markdown("**収入: 実績 vs 目標ペース**")
-                        st.altair_chart(render_target_progress_chart("income", income_target))
-            if expense_target > 0:
-                with target_chart_cols[1]:
-                    with st.container(border=True):
-                        st.markdown("**支出: 実績 vs 目標ペース**")
-                        st.altair_chart(render_target_progress_chart("expense", expense_target))
+                .properties(height=300)
+            )
+            with st.container(border=True):
+                st.markdown("**支出: 実績 vs 目標ペース**")
+                st.altair_chart(expense_target_chart)
 
         chart_cols = st.columns(2)
 
@@ -307,16 +304,23 @@ with tab_dashboard:
 
         display_df = all_transactions.copy()
         display_df["type"] = display_df["type"].map(TYPE_LABELS)
+        account_name_map = {
+            row.id: f"{row.owner}: {row.name}" for row in accounts_df.itertuples()
+        }
+        display_df["account"] = display_df["account_id"].map(account_name_map).fillna("未設定")
 
         event = st.dataframe(
             display_df,
             column_config={
                 "id": None,
+                "account_id": None,
+                "signed_amount": None,
                 "date": st.column_config.DateColumn("日付"),
                 "type": st.column_config.TextColumn("種別"),
                 "category": st.column_config.TextColumn("カテゴリ"),
                 "amount": st.column_config.NumberColumn("金額", format="¥%.0f"),
                 "memo": st.column_config.TextColumn("メモ"),
+                "account": st.column_config.TextColumn("口座/カード"),
             },
             hide_index=True,
             on_select="rerun",
@@ -497,14 +501,15 @@ with tab_settings:
                 key="growth_lifetime_input",
             )
 
-        st.markdown("##### 年間目標")
+        st.markdown("##### 年収・支出設定")
         target_cols_input = st.columns(2)
         with target_cols_input[0]:
-            annual_income_target = st.number_input(
-                "手取り年収（目標）",
+            annual_income = st.number_input(
+                "手取り年収",
                 min_value=0,
                 step=10000,
-                value=int(settings[SETTING_ANNUAL_INCOME_TARGET]),
+                value=int(settings[SETTING_ANNUAL_INCOME]),
+                help="毎月の給与を記録しなくても、この設定値（÷12）が月々の収入実績として健全化アドバイスの計算に自動的に使われます。",
             )
         with target_cols_input[1]:
             annual_expense_target = st.number_input(
@@ -512,6 +517,7 @@ with tab_settings:
                 min_value=0,
                 step=10000,
                 value=int(settings[SETTING_ANNUAL_EXPENSE_TARGET]),
+                help="ダッシュボードで実績とのズレをグラフ表示するための目標値です。",
             )
 
         if st.form_submit_button("保存", type="primary"):
@@ -520,7 +526,56 @@ with tab_settings:
             set_setting(SETTING_TSUMITATE_LIFETIME_BEFORE, tsumitate_lifetime)
             set_setting(SETTING_GROWTH_YTD_BEFORE, growth_ytd)
             set_setting(SETTING_GROWTH_LIFETIME_BEFORE, growth_lifetime)
-            set_setting(SETTING_ANNUAL_INCOME_TARGET, annual_income_target)
+            set_setting(SETTING_ANNUAL_INCOME, annual_income)
             set_setting(SETTING_ANNUAL_EXPENSE_TARGET, annual_expense_target)
             st.toast("初期設定を保存しました。", icon=":material/check_circle:")
             st.rerun()
+
+
+# =============================================================================
+# Tab: 口座・カード
+# =============================================================================
+
+with tab_accounts:
+    st.caption("夫婦それぞれの銀行口座・クレジットカードを登録すると、取引ごとにどれを使ったか記録でき、口座/カード別の残高も確認できます。")
+
+    with st.form("add_account", clear_on_submit=True):
+        acc_cols = st.columns([1, 1, 2, 1])
+        with acc_cols[0]:
+            acc_owner = st.selectbox("所有者", options=OWNERS)
+        with acc_cols[1]:
+            acc_kind_label = st.selectbox("種類", options=list(ACCOUNT_KINDS.values()))
+        with acc_cols[2]:
+            acc_name = st.text_input("名前", placeholder="例: みずほ銀行、楽天カード")
+        with acc_cols[3]:
+            acc_initial = st.number_input("初期残高", step=1000)
+
+        if st.form_submit_button("追加", type="primary"):
+            kind_key = {label: key for key, label in ACCOUNT_KINDS.items()}[acc_kind_label]
+            if acc_name.strip():
+                add_account(acc_owner, acc_name.strip(), kind_key, acc_initial)
+                st.rerun()
+            else:
+                st.error("名前を入力してください。")
+
+    st.markdown("#### 登録済みの口座・カード")
+    if accounts_df.empty:
+        st.info("まだ口座・カードが登録されていません。")
+    else:
+        for owner in OWNERS:
+            owner_accounts = accounts_df[accounts_df["owner"] == owner]
+            if owner_accounts.empty:
+                continue
+            st.markdown(f"**{owner}**")
+            for row in owner_accounts.itertuples():
+                row_cols = st.columns([2, 1, 1, 1])
+                with row_cols[0]:
+                    st.write(f"{row.name}（{ACCOUNT_KINDS[row.kind]}）")
+                with row_cols[1]:
+                    st.write(f"¥{account_balances[row.id]:,.0f}")
+                with row_cols[2]:
+                    st.write("")
+                with row_cols[3]:
+                    if st.button(":material/delete:", key=f"del_account_{row.id}", type="tertiary"):
+                        delete_account(row.id)
+                        st.rerun()

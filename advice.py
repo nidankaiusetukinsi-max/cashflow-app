@@ -7,6 +7,7 @@ import pandas as pd
 from db import (
     NISA_GROWTH_ANNUAL_LIMIT,
     NISA_TSUMITATE_ANNUAL_LIMIT,
+    SETTING_ANNUAL_INCOME,
     SETTING_GROWTH_YTD_BEFORE,
     SETTING_TSUMITATE_YTD_BEFORE,
 )
@@ -26,7 +27,8 @@ def generate_advice(
     ]
     this_year = all_transactions[all_transactions["date"].dt.year == today.year]
 
-    income = this_month.loc[this_month["type"] == "income", "amount"].sum()
+    monthly_salary = settings.get(SETTING_ANNUAL_INCOME, 0.0) / 12
+    income = monthly_salary + this_month.loc[this_month["type"] == "income", "amount"].sum()
     expense = this_month.loc[this_month["type"] == "expense", "amount"].sum()
 
     # --- 資産形成率（収入のうち支出に回らなかった割合） ---
