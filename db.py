@@ -152,6 +152,15 @@ def get_connection() -> psycopg2.extensions.connection:
             )
             """
         )
+        # 車のローンなど、支払いが終わる時期が決まっている固定費・ボーナス月の増額払いに対応。
+        cur.execute("ALTER TABLE recurring_expenses ADD COLUMN IF NOT EXISTS end_year INTEGER")
+        cur.execute("ALTER TABLE recurring_expenses ADD COLUMN IF NOT EXISTS end_month INTEGER")
+        cur.execute(
+            "ALTER TABLE recurring_expenses ADD COLUMN IF NOT EXISTS "
+            "bonus_amount DOUBLE PRECISION NOT NULL DEFAULT 0"
+        )
+        cur.execute("ALTER TABLE recurring_expenses ADD COLUMN IF NOT EXISTS bonus_month_1 INTEGER")
+        cur.execute("ALTER TABLE recurring_expenses ADD COLUMN IF NOT EXISTS bonus_month_2 INTEGER")
         cur.execute(
             "ALTER TABLE transactions ADD COLUMN IF NOT EXISTS "
             "recurring_expense_id INTEGER REFERENCES recurring_expenses(id) ON DELETE SET NULL"
@@ -342,14 +351,36 @@ def get_accounts() -> pd.DataFrame:
 
 @_with_reconnect
 def add_recurring_expense(
-    name: str, category: str, amount: float, account_id: int | None, day_of_month: int
+    name: str,
+    category: str,
+    amount: float,
+    account_id: int | None,
+    day_of_month: int,
+    end_year: int | None = None,
+    end_month: int | None = None,
+    bonus_amount: float = 0,
+    bonus_month_1: int | None = None,
+    bonus_month_2: int | None = None,
 ) -> None:
     conn = get_connection()
     with conn.cursor() as cur:
         cur.execute(
-            "INSERT INTO recurring_expenses (name, category, amount, account_id, day_of_month) "
-            "VALUES (%s, %s, %s, %s, %s)",
-            (name, category, amount, account_id, day_of_month),
+            "INSERT INTO recurring_expenses "
+            "(name, category, amount, account_id, day_of_month, end_year, end_month, "
+            "bonus_amount, bonus_month_1, bonus_month_2) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            (
+                name,
+                category,
+                amount,
+                account_id,
+                day_of_month,
+                end_year,
+                end_month,
+                bonus_amount,
+                bonus_month_1,
+                bonus_month_2,
+            ),
         )
     conn.commit()
 
@@ -366,7 +397,8 @@ def delete_recurring_expense(recurring_id: int) -> None:
 def get_recurring_expenses() -> pd.DataFrame:
     conn = get_connection()
     df = pd.read_sql_query(
-        "SELECT id, name, category, amount, account_id, day_of_month "
+        "SELECT id, name, category, amount, account_id, day_of_month, "
+        "end_year, end_month, bonus_amount, bonus_month_1, bonus_month_2 "
         "FROM recurring_expenses ORDER BY day_of_month, id",
         conn,
     )
@@ -375,14 +407,35 @@ def get_recurring_expenses() -> pd.DataFrame:
 
 @_with_reconnect
 def apply_recurring_expenses() -> None:
-    """Insert this month's expense transaction for each recurring expense once its day has passed."""
+    """Insert this month's expense transaction for each recurring expense once its day has passed.
+
+    Stops once the optional end year/month has passed, and adds the optional bonus amount
+    on either of the two configured bonus months (e.g. a car loan's June/December top-up).
+    """
     conn = get_connection()
     today = date_.today()
     with conn.cursor() as cur:
-        cur.execute("SELECT id, name, category, amount, account_id, day_of_month FROM recurring_expenses")
+        cur.execute(
+            "SELECT id, name, category, amount, account_id, day_of_month, "
+            "end_year, end_month, bonus_amount, bonus_month_1, bonus_month_2 FROM recurring_expenses"
+        )
         rows = cur.fetchall()
-        for rec_id, name, category, amount, account_id, day_of_month in rows:
+        for (
+            rec_id,
+            name,
+            category,
+            amount,
+            account_id,
+            day_of_month,
+            end_year,
+            end_month,
+            bonus_amount,
+            bonus_month_1,
+            bonus_month_2,
+        ) in rows:
             if today.day < day_of_month:
+                continue
+            if end_year and (today.year, today.month) > (int(end_year), int(end_month or 12)):
                 continue
             cur.execute(
                 "SELECT 1 FROM transactions WHERE recurring_expense_id = %s "
@@ -391,11 +444,16 @@ def apply_recurring_expenses() -> None:
             )
             if cur.fetchone():
                 continue
+            applied_amount = amount
+            memo = f"{name}（固定費自動引き落とし）"
+            if bonus_amount and today.month in (bonus_month_1, bonus_month_2):
+                applied_amount += bonus_amount
+                memo = f"{name}（固定費自動引き落とし・ボーナス加算）"
             applied_date = date_(today.year, today.month, day_of_month)
             cur.execute(
                 "INSERT INTO transactions (date, type, category, amount, memo, account_id, recurring_expense_id) "
                 "VALUES (%s, 'expense', %s, %s, %s, %s, %s)",
-                (applied_date, category, amount, f"{name}（固定費自動引き落とし）", account_id, rec_id),
+                (applied_date, category, applied_amount, memo, account_id, rec_id),
             )
     conn.commit()
 

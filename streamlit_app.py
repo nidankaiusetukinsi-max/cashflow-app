@@ -833,14 +833,14 @@ with tab_accounts:
 
 with tab_recurring:
     st.caption(
-        "家賃やサブスクなど毎月決まった日に発生する固定費を登録すると、"
+        "家賃やサブスク、車のローンなど毎月決まった日に発生する固定費を登録すると、"
         "その日を過ぎてからアプリを開いたタイミングで自動的に支出として記録され、指定した口座/カードの残高にも反映されます。"
     )
 
     with st.form("add_recurring", clear_on_submit=True):
         rec_cols = st.columns([2, 1, 1, 2, 1])
         with rec_cols[0]:
-            rec_name = st.text_input("名称", placeholder="例: 家賃、サブスク")
+            rec_name = st.text_input("名称", placeholder="例: 家賃、サブスク、車のローン")
         with rec_cols[1]:
             rec_category = st.selectbox("カテゴリ", options=EXPENSE_CATEGORIES, key="rec_category")
         with rec_cols[2]:
@@ -855,14 +855,52 @@ with tab_recurring:
         with rec_cols[4]:
             rec_day = st.number_input("引き落とし日", min_value=1, max_value=28, value=27, step=1, key="rec_day")
 
+        st.markdown("###### 支払い終了日・ボーナス払い（車のローンなど、任意）")
+        st.caption("支払いが終わる時期が決まっている場合や、ボーナス月に増額返済がある場合に設定してください。")
+        end_cols = st.columns(2)
+        with end_cols[0]:
+            rec_end_year = st.number_input(
+                "支払い終了年（西暦）", min_value=0, max_value=2200, step=1, value=0, key="rec_end_year"
+            )
+        with end_cols[1]:
+            rec_end_month = st.number_input(
+                "支払い終了月", min_value=0, max_value=12, step=1, value=0, key="rec_end_month"
+            )
+
+        month_options = ["なし"] + [f"{m}月" for m in range(1, 13)]
+        bonus_cols = st.columns(3)
+        with bonus_cols[0]:
+            rec_bonus_amount = st.number_input(
+                "ボーナス月の加算返済額", min_value=0, step=1000, value=0, key="rec_bonus_amount"
+            )
+        with bonus_cols[1]:
+            rec_bonus_month_1_label = st.selectbox(
+                "ボーナス月1", options=month_options, index=6, key="rec_bonus_month_1"
+            )
+        with bonus_cols[2]:
+            rec_bonus_month_2_label = st.selectbox(
+                "ボーナス月2", options=month_options, index=12, key="rec_bonus_month_2"
+            )
+
         if st.form_submit_button("登録", type="primary"):
             if rec_name.strip():
+                bonus_month_1 = (
+                    None if rec_bonus_month_1_label == "なし" else int(rec_bonus_month_1_label.replace("月", ""))
+                )
+                bonus_month_2 = (
+                    None if rec_bonus_month_2_label == "なし" else int(rec_bonus_month_2_label.replace("月", ""))
+                )
                 add_recurring_expense(
                     rec_name.strip(),
                     rec_category,
                     rec_amount,
                     rec_account_labels[rec_account_label],
                     int(rec_day),
+                    end_year=int(rec_end_year) or None,
+                    end_month=int(rec_end_month) or None,
+                    bonus_amount=rec_bonus_amount,
+                    bonus_month_1=bonus_month_1,
+                    bonus_month_2=bonus_month_2,
                 )
                 st.rerun()
             else:
@@ -887,6 +925,20 @@ with tab_recurring:
                 if st.button(":material/delete:", key=f"del_recurring_{row.id}", type="tertiary"):
                     delete_recurring_expense(row.id)
                     st.rerun()
+
+            detail_parts = []
+            if pd.notna(row.end_year) and row.end_year:
+                end_label = f"{int(row.end_year)}年"
+                if pd.notna(row.end_month) and row.end_month:
+                    end_label += f"{int(row.end_month)}月"
+                detail_parts.append(f"支払い終了: {end_label}")
+            if pd.notna(row.bonus_amount) and row.bonus_amount:
+                bonus_months = [
+                    f"{int(m)}月" for m in (row.bonus_month_1, row.bonus_month_2) if pd.notna(m) and m
+                ]
+                detail_parts.append(f"ボーナス加算: ¥{row.bonus_amount:,.0f}（{', '.join(bonus_months)}）")
+            if detail_parts:
+                st.caption(" / ".join(detail_parts))
 
 
 # =============================================================================
