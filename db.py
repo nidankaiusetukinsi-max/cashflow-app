@@ -9,7 +9,7 @@ import psycopg2.extensions
 import streamlit as st
 
 INCOME_CATEGORIES = ["副業", "投資", "その他収入"]
-EXPENSE_CATEGORIES = ["食費", "住居", "光熱費", "交通", "娯楽", "医療", "育児", "その他支出"]
+DEFAULT_EXPENSE_CATEGORIES = ["食費", "住居", "光熱費", "交通", "娯楽", "医療", "育児", "その他支出"]
 NISA_CATEGORIES = ["つみたて投資枠", "成長投資枠"]
 
 OWNERS = ["夫", "嫁"]
@@ -30,6 +30,8 @@ SETTING_TSUMITATE_YTD_BEFORE = "tsumitate_ytd_before"
 SETTING_GROWTH_YTD_BEFORE = "growth_ytd_before"
 SETTING_ANNUAL_INCOME = "annual_income"
 SETTING_ANNUAL_EXPENSE_TARGET = "annual_expense_target"
+SETTING_ANNUAL_INCOME_HUSBAND = "annual_income_husband"
+SETTING_ANNUAL_INCOME_WIFE = "annual_income_wife"
 
 # ライフプラン（将来予測）関連のキー。
 SETTING_HUSBAND_BIRTH_YEAR = "husband_birth_year"
@@ -85,6 +87,8 @@ SETTINGS_KEYS = [
     SETTING_GROWTH_YTD_BEFORE_WIFE,
     SETTING_GROWTH_LIFETIME_BEFORE_HUSBAND,
     SETTING_GROWTH_LIFETIME_BEFORE_WIFE,
+    SETTING_ANNUAL_INCOME_HUSBAND,
+    SETTING_ANNUAL_INCOME_WIFE,
 ]
 
 
@@ -196,6 +200,21 @@ def get_connection() -> psycopg2.extensions.connection:
             )
             """
         )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS expense_categories (
+                id SERIAL PRIMARY KEY,
+                name TEXT UNIQUE NOT NULL
+            )
+            """
+        )
+        cur.execute("SELECT COUNT(*) FROM expense_categories")
+        if cur.fetchone()[0] == 0:
+            for category_name in DEFAULT_EXPENSE_CATEGORIES:
+                cur.execute(
+                    "INSERT INTO expense_categories (name) VALUES (%s) ON CONFLICT (name) DO NOTHING",
+                    (category_name,),
+                )
     conn.commit()
     return conn
 
@@ -544,3 +563,30 @@ def get_children() -> pd.DataFrame:
         "SELECT id, name, birth_year FROM children ORDER BY birth_year DESC, id", conn
     )
     return df
+
+
+@_with_reconnect
+def add_expense_category(name: str) -> None:
+    conn = get_connection()
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO expense_categories (name) VALUES (%s) ON CONFLICT (name) DO NOTHING", (name,)
+        )
+    conn.commit()
+
+
+@_with_reconnect
+def delete_expense_category(name: str) -> None:
+    conn = get_connection()
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM expense_categories WHERE name = %s", (name,))
+    conn.commit()
+
+
+@_with_reconnect
+def get_expense_categories() -> list[str]:
+    conn = get_connection()
+    with conn.cursor() as cur:
+        cur.execute("SELECT name FROM expense_categories ORDER BY id")
+        rows = cur.fetchall()
+    return [row[0] for row in rows]

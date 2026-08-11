@@ -9,7 +9,6 @@ import streamlit as st
 from advice import generate_advice
 from db import (
     ACCOUNT_KINDS,
-    EXPENSE_CATEGORIES,
     INCOME_CATEGORIES,
     NISA_CATEGORIES,
     NISA_GROWTH_ANNUAL_LIMIT,
@@ -18,7 +17,8 @@ from db import (
     NISA_TSUMITATE_ANNUAL_LIMIT,
     OWNERS,
     SETTING_ANNUAL_EXPENSE_TARGET,
-    SETTING_ANNUAL_INCOME,
+    SETTING_ANNUAL_INCOME_HUSBAND,
+    SETTING_ANNUAL_INCOME_WIFE,
     SETTING_CHILDCARE_ANNUAL_COST,
     SETTING_CHILDCARE_END_AGE,
     SETTING_GROWTH_LIFETIME_BEFORE,
@@ -38,6 +38,7 @@ from db import (
     SETTING_TSUMITATE_LIFETIME_BEFORE,
     SETTING_TSUMITATE_LIFETIME_BEFORE_HUSBAND,
     SETTING_TSUMITATE_LIFETIME_BEFORE_WIFE,
+    SETTING_ANNUAL_INCOME,
     SETTING_TSUMITATE_YTD_BEFORE,
     SETTING_TSUMITATE_YTD_BEFORE_HUSBAND,
     SETTING_TSUMITATE_YTD_BEFORE_WIFE,
@@ -47,6 +48,7 @@ from db import (
     SETTING_WIFE_RETIREMENT_AGE,
     add_account,
     add_child,
+    add_expense_category,
     add_recurring_expense,
     add_recurring_investment,
     add_transaction,
@@ -56,12 +58,14 @@ from db import (
     delete_account,
     delete_budget,
     delete_child,
+    delete_expense_category,
     delete_recurring_expense,
     delete_recurring_investment,
     delete_transactions,
     get_accounts,
     get_budgets,
     get_children,
+    get_expense_categories,
     get_recurring_expenses,
     get_recurring_investments,
     get_settings,
@@ -137,8 +141,22 @@ budgets = get_budgets()
 settings = get_settings()
 accounts_df = get_accounts()
 recurring_df = get_recurring_expenses()
+expense_categories = get_expense_categories()
 
 account_name_map: dict[int, str] = {row.id: f"{row.owner}: {row.name}" for row in accounts_df.itertuples()}
+
+OWNER_NISA_YTD_KEYS = {
+    ("夫", "つみたて投資枠"): SETTING_TSUMITATE_YTD_BEFORE_HUSBAND,
+    ("嫁", "つみたて投資枠"): SETTING_TSUMITATE_YTD_BEFORE_WIFE,
+    ("夫", "成長投資枠"): SETTING_GROWTH_YTD_BEFORE_HUSBAND,
+    ("嫁", "成長投資枠"): SETTING_GROWTH_YTD_BEFORE_WIFE,
+}
+OWNER_NISA_LIFETIME_KEYS = {
+    ("夫", "つみたて投資枠"): SETTING_TSUMITATE_LIFETIME_BEFORE_HUSBAND,
+    ("嫁", "つみたて投資枠"): SETTING_TSUMITATE_LIFETIME_BEFORE_WIFE,
+    ("夫", "成長投資枠"): SETTING_GROWTH_LIFETIME_BEFORE_HUSBAND,
+    ("嫁", "成長投資枠"): SETTING_GROWTH_LIFETIME_BEFORE_WIFE,
+}
 
 all_transactions["signed_amount"] = all_transactions["amount"].where(
     all_transactions["type"] == "income", -all_transactions["amount"]
@@ -164,6 +182,23 @@ nisa_lifetime_total = (
 )
 total_assets = current_balance + nisa_lifetime_total
 
+# 夫婦それぞれの資産（口座残高 + NISA拠出累計）。所有者未設定分は世帯共通としてどちらにも含めない。
+investment_all = all_transactions[all_transactions["type"] == "investment"]
+owner_account_totals: dict[str, float] = {}
+owner_nisa_totals: dict[str, float] = {}
+owner_total_assets: dict[str, float] = {}
+for owner in OWNERS:
+    owner_account_ids = accounts_df.loc[accounts_df["owner"] == owner, "id"]
+    owner_account_totals[owner] = sum(account_balances.get(aid, 0.0) for aid in owner_account_ids)
+    owner_investment_all = investment_all[investment_all["owner"] == owner]
+    owner_nisa_totals[owner] = (
+        owner_investment_all["amount"].sum()
+        + settings[OWNER_NISA_LIFETIME_KEYS[(owner, "つみたて投資枠")]]
+        + settings[OWNER_NISA_LIFETIME_KEYS[(owner, "成長投資枠")]]
+    )
+    owner_total_assets[owner] = owner_account_totals[owner] + owner_nisa_totals[owner]
+shared_cash = settings[SETTING_INITIAL_CASH] + untagged_net
+
 
 # =============================================================================
 # Sidebar: new transaction form
@@ -184,7 +219,7 @@ with st.sidebar:
         elif entry_type == "投資(NISA)":
             categories = NISA_CATEGORIES
         else:
-            categories = EXPENSE_CATEGORIES
+            categories = expense_categories
         entry_category = st.selectbox("カテゴリ", options=categories)
         entry_amount = st.number_input("金額", min_value=0, step=100)
         entry_memo = st.text_input("メモ", label_visibility="collapsed", placeholder="メモ（任意）")
@@ -228,6 +263,28 @@ with tab_dashboard:
         st.info("左のフォームから取引を追加してください。「初期設定」タブで現在の残高も登録できます。")
     else:
         st.metric("現在の残高（初期設定 + 全口座 + 未設定分の取引合計）", f"¥{current_balance:,.0f}")
+
+        st.markdown("### 資産状況（夫婦別・全体）")
+        asset_summary_cols = st.columns(len(OWNERS) + 1)
+        for i, owner in enumerate(OWNERS):
+            with asset_summary_cols[i]:
+                st.metric(
+                    f"{owner}の資産（口座 + NISA）",
+                    f"¥{owner_total_assets[owner]:,.0f}",
+                    help=(
+                        f"口座・カード残高 ¥{owner_account_totals[owner]:,.0f} "
+                        f"+ NISA拠出累計 ¥{owner_nisa_totals[owner]:,.0f}"
+                    ),
+                )
+        with asset_summary_cols[-1]:
+            st.metric(
+                "世帯全体の総資産",
+                f"¥{total_assets:,.0f}",
+                help=(
+                    f"夫・嫁それぞれの資産に加え、現金・預金の共通分 ¥{shared_cash:,.0f} を含む世帯全体の合計です。"
+                    "所有者が未設定の古い取引がある場合、この合計と夫婦別の内訳が完全には一致しないことがあります。"
+                ),
+            )
 
         if not accounts_df.empty:
             st.markdown("**口座・カード別残高**")
@@ -449,18 +506,8 @@ with tab_nisa:
     this_year = date.today().year
     investment_this_year = investment_df[investment_df["date"].dt.year == this_year]
 
-    owner_ytd_keys = {
-        ("夫", "つみたて投資枠"): SETTING_TSUMITATE_YTD_BEFORE_HUSBAND,
-        ("嫁", "つみたて投資枠"): SETTING_TSUMITATE_YTD_BEFORE_WIFE,
-        ("夫", "成長投資枠"): SETTING_GROWTH_YTD_BEFORE_HUSBAND,
-        ("嫁", "成長投資枠"): SETTING_GROWTH_YTD_BEFORE_WIFE,
-    }
-    owner_lifetime_keys = {
-        ("夫", "つみたて投資枠"): SETTING_TSUMITATE_LIFETIME_BEFORE_HUSBAND,
-        ("嫁", "つみたて投資枠"): SETTING_TSUMITATE_LIFETIME_BEFORE_WIFE,
-        ("夫", "成長投資枠"): SETTING_GROWTH_LIFETIME_BEFORE_HUSBAND,
-        ("嫁", "成長投資枠"): SETTING_GROWTH_LIFETIME_BEFORE_WIFE,
-    }
+    owner_ytd_keys = OWNER_NISA_YTD_KEYS
+    owner_lifetime_keys = OWNER_NISA_LIFETIME_KEYS
 
     for owner in OWNERS:
         st.markdown(f"### {owner}のNISA")
@@ -592,17 +639,20 @@ with tab_nisa:
 
 with tab_budget:
     st.markdown("#### カテゴリ別の月予算を設定")
-    with st.form("set_budget", clear_on_submit=True):
-        budget_cols = st.columns([2, 2, 1])
-        with budget_cols[0]:
-            budget_category = st.selectbox("カテゴリ", options=EXPENSE_CATEGORIES)
-        with budget_cols[1]:
-            budget_amount = st.number_input("月予算", min_value=0, step=1000)
-        with budget_cols[2]:
-            st.markdown("&nbsp;")
-            if st.form_submit_button("設定", type="primary"):
-                set_budget(budget_category, budget_amount)
-                st.rerun()
+    if not expense_categories:
+        st.info("下の「カテゴリの管理」から支出カテゴリを追加すると、予算を設定できます。")
+    else:
+        with st.form("set_budget", clear_on_submit=True):
+            budget_cols = st.columns([2, 2, 1])
+            with budget_cols[0]:
+                budget_category = st.selectbox("カテゴリ", options=expense_categories)
+            with budget_cols[1]:
+                budget_amount = st.number_input("月予算", min_value=0, step=1000)
+            with budget_cols[2]:
+                st.markdown("&nbsp;")
+                if st.form_submit_button("設定", type="primary"):
+                    set_budget(budget_category, budget_amount)
+                    st.rerun()
 
     st.markdown("#### 設定済みの予算")
     if not budgets:
@@ -618,6 +668,33 @@ with tab_budget:
                 if st.button(":material/delete:", key=f"del_budget_{category}", type="tertiary"):
                     delete_budget(category)
                     st.rerun()
+
+    st.markdown("---")
+    st.markdown("#### カテゴリの管理")
+    st.caption("支出カテゴリは自由に追加・削除できます。削除しても、過去に記録した取引はそのまま残ります。")
+    with st.form("add_expense_category", clear_on_submit=True):
+        cat_cols = st.columns([3, 1])
+        with cat_cols[0]:
+            new_category_name = st.text_input("新しいカテゴリ名", placeholder="例: ペット、趣味")
+        with cat_cols[1]:
+            st.markdown("&nbsp;")
+            if st.form_submit_button("追加", type="primary"):
+                if new_category_name.strip():
+                    add_expense_category(new_category_name.strip())
+                    st.rerun()
+                else:
+                    st.error("カテゴリ名を入力してください。")
+
+    for category in expense_categories:
+        cat_row_cols = st.columns([3, 1])
+        with cat_row_cols[0]:
+            st.write(category)
+        with cat_row_cols[1]:
+            if len(expense_categories) <= 1:
+                st.caption("最後の1つは削除できません")
+            elif st.button(":material/delete:", key=f"del_category_{category}", type="tertiary"):
+                delete_expense_category(category)
+                st.rerun()
 
 
 # =============================================================================
@@ -708,24 +785,31 @@ with tab_settings:
                 )
             nisa_owner_inputs[nisa_owner] = (o_ytd_t, o_life_t, o_ytd_g, o_life_g)
 
-        st.markdown("##### 年収・支出設定")
-        target_cols_input = st.columns(2)
-        with target_cols_input[0]:
-            annual_income = st.number_input(
-                "手取り年収",
-                min_value=0,
-                step=10000,
-                value=int(settings[SETTING_ANNUAL_INCOME]),
-                help="毎月の給与を記録しなくても、この設定値（÷12）が月々の収入実績として健全化アドバイスの計算に自動的に使われます。",
-            )
-        with target_cols_input[1]:
-            annual_expense_target = st.number_input(
-                "年間目標支出",
-                min_value=0,
-                step=10000,
-                value=int(settings[SETTING_ANNUAL_EXPENSE_TARGET]),
-                help="ダッシュボードで実績とのズレをグラフ表示するための目標値です。",
-            )
+        st.markdown("##### 手取り年収（夫婦それぞれ）")
+        st.caption("毎月の給与を記録しなくても、この設定値（÷12）が月々の収入実績として健全化アドバイスの計算に自動的に使われます。")
+        income_keys = {"夫": SETTING_ANNUAL_INCOME_HUSBAND, "嫁": SETTING_ANNUAL_INCOME_WIFE}
+        # 夫婦別に分ける前の合算値が残っていれば、夫の欄に初期値として引き継ぐ（データ消失防止）。
+        legacy_income_defaults = {"夫": int(settings[SETTING_ANNUAL_INCOME]), "嫁": 0}
+        income_cols = st.columns(2)
+        annual_income_inputs: dict[str, int] = {}
+        for i, income_owner in enumerate(OWNERS):
+            with income_cols[i]:
+                annual_income_inputs[income_owner] = st.number_input(
+                    f"{income_owner}の手取り年収",
+                    min_value=0,
+                    step=10000,
+                    value=int(settings[income_keys[income_owner]]) or legacy_income_defaults[income_owner],
+                    key=f"income_{income_owner}",
+                )
+
+        st.markdown("##### 支出設定")
+        annual_expense_target = st.number_input(
+            "年間目標支出",
+            min_value=0,
+            step=10000,
+            value=int(settings[SETTING_ANNUAL_EXPENSE_TARGET]),
+            help="ダッシュボードで実績とのズレをグラフ表示するための目標値です。",
+        )
 
         if st.form_submit_button("保存", type="primary"):
             set_setting(SETTING_INITIAL_CASH, initial_cash)
@@ -735,7 +819,8 @@ with tab_settings:
                 set_setting(life_t_key, o_life_t)
                 set_setting(ytd_g_key, o_ytd_g)
                 set_setting(life_g_key, o_life_g)
-            set_setting(SETTING_ANNUAL_INCOME, annual_income)
+            for income_owner, income_value in annual_income_inputs.items():
+                set_setting(income_keys[income_owner], income_value)
             set_setting(SETTING_ANNUAL_EXPENSE_TARGET, annual_expense_target)
             st.toast("初期設定を保存しました。", icon=":material/check_circle:")
             st.rerun()
@@ -842,7 +927,7 @@ with tab_recurring:
         with rec_cols[0]:
             rec_name = st.text_input("名称", placeholder="例: 家賃、サブスク、車のローン")
         with rec_cols[1]:
-            rec_category = st.selectbox("カテゴリ", options=EXPENSE_CATEGORIES, key="rec_category")
+            rec_category = st.selectbox("カテゴリ", options=expense_categories, key="rec_category")
         with rec_cols[2]:
             rec_amount = st.number_input("金額", min_value=0, step=100, key="rec_amount")
         with rec_cols[3]:
