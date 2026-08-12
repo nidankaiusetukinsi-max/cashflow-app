@@ -1,5 +1,6 @@
 """Personal cash flow tracker with NISA tracking and budget advice."""
 
+import concurrent.futures
 import hmac
 import time
 from datetime import date
@@ -211,14 +212,51 @@ def _apply_recurring_once(today_: date) -> None:
 
 _apply_recurring_once(today_jst())
 
-all_transactions = get_transactions()
-budgets = get_budgets()
-settings = get_settings()
-present_setting_keys = get_present_setting_keys()
-accounts_df = get_accounts()
-recurring_df = get_recurring_expenses()
-expense_categories = get_expense_categories()
-income_categories = get_income_categories()
+
+def _load_data() -> dict:
+    """Fetch every DB-backed value this rerun needs, concurrently.
+
+    Streamlit reruns this whole script on every widget interaction, and `with tab_x:`
+    blocks all execute unconditionally regardless of which tab is visually active - so
+    every rerun was making ~12 sequential DB round-trips (measured at ~110ms each against
+    this app's Neon region, ~1.3s just in query time before any rendering). None of these
+    queries depend on each other's results, so fetching them concurrently cuts that down
+    to a few parallel batches instead. max_workers is kept below the connection pool's
+    size (see get_pool) so one rerun can't exhaust the pool and starve a concurrent second
+    session (e.g. both spouses using the app at once).
+    """
+    fetchers = {
+        "all_transactions": get_transactions,
+        "budgets": get_budgets,
+        "settings": get_settings,
+        "present_setting_keys": get_present_setting_keys,
+        "accounts_df": get_accounts,
+        "recurring_df": get_recurring_expenses,
+        "expense_categories": get_expense_categories,
+        "income_categories": get_income_categories,
+        "recurring_investments_df": get_recurring_investments,
+        "investment_skips_df": get_recurring_investment_skips,
+        "expense_skips_df": get_recurring_expense_skips,
+        "children_df": get_children,
+    }
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+        futures = {key: executor.submit(fetch) for key, fetch in fetchers.items()}
+        return {key: future.result() for key, future in futures.items()}
+
+
+_data = _load_data()
+all_transactions = _data["all_transactions"]
+budgets = _data["budgets"]
+settings = _data["settings"]
+present_setting_keys = _data["present_setting_keys"]
+accounts_df = _data["accounts_df"]
+recurring_df = _data["recurring_df"]
+expense_categories = _data["expense_categories"]
+income_categories = _data["income_categories"]
+recurring_investments_df = _data["recurring_investments_df"]
+investment_skips_df = _data["investment_skips_df"]
+expense_skips_df = _data["expense_skips_df"]
+children_df = _data["children_df"]
 
 account_name_map: dict[int, str] = {row.id: f"{row.owner}: {row.name}" for row in accounts_df.itertuples()}
 
@@ -903,7 +941,6 @@ with tab_nisa:
             )
             st.rerun()
 
-    recurring_investments_df = get_recurring_investments()
     if recurring_investments_df.empty:
         st.info("まだ定期積立が登録されていません。")
     else:
@@ -1002,7 +1039,6 @@ with tab_nisa:
                         delete_recurring_investment(row.id)
                         st.rerun()
 
-    investment_skips_df = get_recurring_investment_skips()
     if not investment_skips_df.empty:
         st.markdown("#### スキップ中の月")
         st.caption(
@@ -1703,7 +1739,6 @@ with tab_recurring:
                 if detail_parts:
                     st.caption(" / ".join(detail_parts))
 
-    expense_skips_df = get_recurring_expense_skips()
     if not expense_skips_df.empty:
         st.markdown("---")
         st.markdown("#### スキップ中の月")
@@ -1886,7 +1921,6 @@ with tab_lifeplan:
                 add_child(child_name.strip() or None, today_jst().year - child_age)
                 st.rerun()
 
-    children_df = get_children()
     if not children_df.empty:
         for row in children_df.itertuples():
             row_cols = st.columns([2, 1, 1])

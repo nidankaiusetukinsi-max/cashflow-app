@@ -390,8 +390,15 @@ def get_pool() -> psycopg2.pool.ThreadedConnectionPool:
     psycopg2 connection is not safe when more than one person (e.g. both spouses)
     uses the app at the same time. A pool hands each concurrent request its own
     connection instead.
+
+    Sized at 8 (not 5) because streamlit_app.py fetches its independent top-level
+    queries concurrently via a 4-worker ThreadPoolExecutor (see _load_dashboard_data) to
+    cut the ~12 sequential DB round-trips a single rerun used to make (measured at ~110ms
+    each against a remote Neon region) down to a few parallel batches. 8 leaves headroom
+    for two people's reruns to each grab up to 4 connections at once without exhausting
+    the pool (ThreadedConnectionPool.getconn raises immediately rather than waiting).
     """
-    conn_pool = psycopg2.pool.ThreadedConnectionPool(1, 5, st.secrets["DATABASE_URL"])
+    conn_pool = psycopg2.pool.ThreadedConnectionPool(1, 8, st.secrets["DATABASE_URL"])
     conn = conn_pool.getconn()
     try:
         _run_migrations(conn)
