@@ -4,6 +4,7 @@ from datetime import date
 
 import pandas as pd
 
+from timeutil import today_jst
 from db import (
     NISA_GROWTH_ANNUAL_LIMIT,
     NISA_TSUMITATE_ANNUAL_LIMIT,
@@ -12,8 +13,12 @@ from db import (
     SETTING_ANNUAL_INCOME_WIFE,
     SETTING_GROWTH_YTD_BEFORE_HUSBAND,
     SETTING_GROWTH_YTD_BEFORE_WIFE,
+    SETTING_GROWTH_YTD_BEFORE_YEAR_HUSBAND,
+    SETTING_GROWTH_YTD_BEFORE_YEAR_WIFE,
     SETTING_TSUMITATE_YTD_BEFORE_HUSBAND,
     SETTING_TSUMITATE_YTD_BEFORE_WIFE,
+    SETTING_TSUMITATE_YTD_BEFORE_YEAR_HUSBAND,
+    SETTING_TSUMITATE_YTD_BEFORE_YEAR_WIFE,
 )
 
 _YTD_SETTING_KEYS = {
@@ -22,6 +27,33 @@ _YTD_SETTING_KEYS = {
     ("夫", "成長投資枠"): SETTING_GROWTH_YTD_BEFORE_HUSBAND,
     ("嫁", "成長投資枠"): SETTING_GROWTH_YTD_BEFORE_WIFE,
 }
+_YTD_YEAR_SETTING_KEYS = {
+    ("夫", "つみたて投資枠"): SETTING_TSUMITATE_YTD_BEFORE_YEAR_HUSBAND,
+    ("嫁", "つみたて投資枠"): SETTING_TSUMITATE_YTD_BEFORE_YEAR_WIFE,
+    ("夫", "成長投資枠"): SETTING_GROWTH_YTD_BEFORE_YEAR_HUSBAND,
+    ("嫁", "成長投資枠"): SETTING_GROWTH_YTD_BEFORE_YEAR_WIFE,
+}
+
+
+def year_elapsed_ratio(today: date) -> float:
+    """Return how far through `today`'s calendar year has elapsed (leap-year aware)."""
+    days_in_year = (date(today.year + 1, 1, 1) - date(today.year, 1, 1)).days
+    return today.timetuple().tm_yday / days_in_year
+
+
+def effective_nisa_ytd_before(settings: dict[str, float], owner: str, category: str, today: date) -> float:
+    """The "contributed before using the app" NISA baseline, for the year it was recorded.
+
+    This value is meant to represent contributions made earlier in ONE specific calendar
+    year, before the user started tracking NISA in the app. It's tagged with the year it
+    was saved for; once the calendar rolls past that year it must stop being added to
+    "this year's" progress, or every future year would permanently start already at that
+    old baseline.
+    """
+    recorded_year = settings.get(_YTD_YEAR_SETTING_KEYS[(owner, category)], 0.0)
+    if int(recorded_year) != today.year:
+        return 0.0
+    return settings.get(_YTD_SETTING_KEYS[(owner, category)], 0.0)
 
 
 def generate_advice(
@@ -31,7 +63,7 @@ def generate_advice(
 ) -> list[str]:
     """Return a list of Japanese advice strings based on this month's / this year's data."""
     advice: list[str] = []
-    today = date.today()
+    today = today_jst()
 
     this_month = all_transactions[
         (all_transactions["date"].dt.year == today.year) & (all_transactions["date"].dt.month == today.month)
@@ -72,7 +104,7 @@ def generate_advice(
                 )
 
     # --- NISA消化ペース（夫婦それぞれの非課税枠ごとに判定） ---
-    elapsed_ratio = today.timetuple().tm_yday / 365
+    elapsed_ratio = year_elapsed_ratio(today)
     investment_this_year = this_year[this_year["type"] == "investment"]
 
     for owner in OWNERS:
@@ -85,7 +117,7 @@ def generate_advice(
                 owner_investment_this_year.loc[
                     owner_investment_this_year["category"] == category, "amount"
                 ].sum()
-                + settings.get(_YTD_SETTING_KEYS[(owner, category)], 0.0)
+                + effective_nisa_ytd_before(settings, owner, category, today)
             )
             if contributed == 0:
                 continue

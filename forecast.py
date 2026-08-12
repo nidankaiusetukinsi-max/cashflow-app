@@ -3,10 +3,9 @@
 These are rough, illustrative projections for household planning, not financial advice.
 """
 
-from datetime import date
-
 import pandas as pd
 
+from timeutil import today_jst
 from db import (
     SETTING_CHILDCARE_ANNUAL_COST,
     SETTING_CHILDCARE_END_AGE,
@@ -28,7 +27,7 @@ HORIZON_YEARS = 40
 
 def build_expense_forecast(base_annual_expense: float, settings: dict[str, float]) -> pd.DataFrame:
     """Project annual expense forward, adjusted for inflation and mortgage payoff, plus pension income."""
-    start_year = date.today().year
+    start_year = today_jst().year
     inflation_rate = settings.get(SETTING_INFLATION_RATE, 0.0) / 100
     mortgage_annual = settings.get(SETTING_MORTGAGE_MONTHLY_PAYMENT, 0.0) * 12
     mortgage_payoff_year = settings.get(SETTING_MORTGAGE_PAYOFF_YEAR, 0.0)
@@ -88,7 +87,7 @@ def build_childcare_forecast(settings: dict[str, float], children: pd.DataFrame)
     if children.empty:
         return pd.DataFrame(columns=["year", "childcare_cost"])
 
-    start_year = date.today().year
+    start_year = today_jst().year
     inflation_rate = settings.get(SETTING_INFLATION_RATE, 0.0) / 100
     annual_cost = settings.get(SETTING_CHILDCARE_ANNUAL_COST, 0.0)
     end_age = settings.get(SETTING_CHILDCARE_END_AGE, 0.0) or 22
