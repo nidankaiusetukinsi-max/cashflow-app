@@ -22,6 +22,7 @@ from ui_helpers import (
     filter_by_time_range,
     month_select_index,
     parse_month_label,
+    progress_ratio,
     resolved_default,
     safe_index,
     time_range_start,
@@ -886,25 +887,25 @@ with tab_nisa:
         with annual_cols[0]:
             with st.container(border=True):
                 st.markdown("**つみたて投資枠（年間）**")
-                ratio = min(tsumitate_this_year / NISA_TSUMITATE_ANNUAL_LIMIT, 1.0)
+                ratio = progress_ratio(tsumitate_this_year, NISA_TSUMITATE_ANNUAL_LIMIT)
                 st.progress(ratio, text=f"¥{tsumitate_this_year:,.0f} / ¥{NISA_TSUMITATE_ANNUAL_LIMIT:,.0f}")
         with annual_cols[1]:
             with st.container(border=True):
                 st.markdown("**成長投資枠（年間）**")
-                ratio = min(growth_this_year / NISA_GROWTH_ANNUAL_LIMIT, 1.0)
+                ratio = progress_ratio(growth_this_year, NISA_GROWTH_ANNUAL_LIMIT)
                 st.progress(ratio, text=f"¥{growth_this_year:,.0f} / ¥{NISA_GROWTH_ANNUAL_LIMIT:,.0f}")
 
         lifetime_cols = st.columns(2)
         with lifetime_cols[0]:
             with st.container(border=True):
                 st.markdown("**成長投資枠（生涯上限あり）**")
-                ratio = min(growth_lifetime / NISA_GROWTH_LIFETIME_LIMIT, 1.0)
+                ratio = progress_ratio(growth_lifetime, NISA_GROWTH_LIFETIME_LIMIT)
                 st.progress(ratio, text=f"¥{growth_lifetime:,.0f} / ¥{NISA_GROWTH_LIFETIME_LIMIT:,.0f}")
         with lifetime_cols[1]:
             with st.container(border=True):
                 st.markdown("**生涯投資枠合計**")
                 total_lifetime = tsumitate_lifetime + growth_lifetime
-                ratio = min(total_lifetime / NISA_LIFETIME_LIMIT, 1.0)
+                ratio = progress_ratio(total_lifetime, NISA_LIFETIME_LIMIT)
                 st.progress(ratio, text=f"¥{total_lifetime:,.0f} / ¥{NISA_LIFETIME_LIMIT:,.0f}")
 
     if investment_df["owner"].isna().any():

@@ -115,6 +115,18 @@ def category_edit_options(categories: list[str], current_category: str) -> tuple
     return [current_category, *categories], 0
 
 
+def progress_ratio(value: float, limit: float) -> float:
+    """value/limit clamped to [0.0, 1.0], safe to pass straight into st.progress().
+
+    NISA contribution totals can go negative (a recorded sale/withdrawal can outweigh the
+    contributions made so far - see the "投資(NISA)" amount fields in streamlit_app.py), and
+    st.progress() raises StreamlitAPIException for anything outside [0, 1] - which would take
+    down the whole rerun, not just this one progress bar. A plain `min(value/limit, 1.0)` only
+    guards the upper bound.
+    """
+    return max(0.0, min(value / limit, 1.0))
+
+
 def csv_safe_value(value):
     """Prefix a leading apostrophe onto free-text values that Excel/Sheets would otherwise
     interpret as a formula when opening a CSV export (=, +, -, @ at the start of a cell).

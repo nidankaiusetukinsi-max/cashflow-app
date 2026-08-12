@@ -10,6 +10,7 @@ from ui_helpers import (
     filter_by_time_range,
     month_select_index,
     parse_month_label,
+    progress_ratio,
     resolved_default,
     safe_index,
     time_range_start,
@@ -121,6 +122,22 @@ def test_category_edit_options_preserves_deleted_category_instead_of_silently_sw
     options, index = category_edit_options(["食費", "住居"], "旧カテゴリ")
     assert options[index] == "旧カテゴリ"
     assert "旧カテゴリ" in options
+
+
+def test_progress_ratio_clamps_upper_bound():
+    assert progress_ratio(1_500_000, 1_200_000) == 1.0
+
+
+def test_progress_ratio_clamps_negative_totals_to_zero_instead_of_raising():
+    # Regression test: a NISA sale/withdrawal (see the negative-amount handling for
+    # 投資(NISA) transactions in streamlit_app.py) can push a cumulative total negative.
+    # st.progress() raises StreamlitAPIException for any value outside [0, 1], which would
+    # crash the whole rerun - progress_ratio must clamp instead of just capping the top end.
+    assert progress_ratio(-500_000, 1_200_000) == 0.0
+
+
+def test_progress_ratio_normal_value_passes_through():
+    assert progress_ratio(600_000, 1_200_000) == 0.5
 
 
 def test_csv_safe_value_prefixes_formula_looking_strings():
