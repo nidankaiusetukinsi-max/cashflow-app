@@ -1,1 +1,25 @@
+name: Keep Streamlit app awake
 
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping app to prevent Streamlit Community Cloud sleep
+        env:
+          APP_URL: ${{ secrets.APP_URL }}
+        run: |
+          if [ -z "$APP_URL" ]; then
+            echo "APP_URL secret is not set. Add it under Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+          status=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 "$APP_URL")
+          echo "App responded with HTTP $status"
+          if [ "$status" -lt 200 ] || [ "$status" -ge 400 ]; then
+            echo "Unexpected status code: $status"
+            exit 1
+          fi
