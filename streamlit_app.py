@@ -35,7 +35,9 @@ from db import (
     NISA_LIFETIME_LIMIT,
     NISA_TSUMITATE_ANNUAL_LIMIT,
     OWNERS,
+    CategoryNameTakenError,
     RecordInUseError,
+    ReservedCategoryNameError,
     SETTING_ANNUAL_EXPENSE_TARGET,
     SETTING_ANNUAL_INCOME_HUSBAND,
     SETTING_ANNUAL_INCOME_WIFE,
@@ -105,6 +107,8 @@ from db import (
     get_settings,
     get_transactions,
     record_login_failure,
+    rename_expense_category,
+    rename_income_category,
     reset_login_attempts,
     resume_recurring_expense,
     resume_recurring_investment,
@@ -278,6 +282,38 @@ def confirm_delete(
     with st.popover(icon_label):
         st.write(message)
         return st.button("削除する", key=f"{key}_confirm_delete", type="primary")
+
+
+def rename_category_control(icon_label: str, key: str, current_name: str, rename_fn) -> None:
+    """A rename trigger (icon + popover with a text input), mirroring confirm_delete's UX.
+
+    Unlike delete, renaming works even while the category is in use - it's the only way to
+    fix a typo'd/duplicated category name without abandoning its transaction history, since
+    a category with any usage can never be deleted (see delete_expense_category/
+    delete_income_category).
+    """
+    with st.popover(icon_label):
+        new_name = st.text_input("新しいカテゴリ名", value=current_name, key=f"{key}_rename_input")
+        if st.button("変更する", key=f"{key}_rename_confirm", type="primary"):
+            new_name = new_name.strip()
+            if not new_name:
+                st.error("カテゴリ名を入力してください。")
+            elif new_name == current_name:
+                st.info("変更がありません。")
+            else:
+                try:
+                    rename_fn(current_name, new_name)
+                    st.rerun()
+                except CategoryNameTakenError:
+                    st.error(
+                        f"「{new_name}」は既に存在するため変更できません"
+                        "（カテゴリの統合はサポートされていません）。"
+                    )
+                except ReservedCategoryNameError:
+                    st.error(
+                        f"「{new_name}」は給与管理用に予約された名前のため使用できません。"
+                        "給与は「初期設定」タブの手取り年収で管理してください。"
+                    )
 
 # 残高・当期集計は「今日以前」の取引だけを基準にする。未来日の取引を計算に含めると、まだ
 # 発生していない金額で現在の残高・当年NISA進捗・当月予算実績が汚染されてしまうため。
@@ -496,7 +532,13 @@ with tab_dashboard:
                     st.altair_chart(pct_chart)
 
         st.markdown("### 健全化アドバイス")
-        for tip in generate_advice(transactions_to_date, budgets, settings):
+        st.caption(
+            "一般的なFPの目安に基づくルールベースの参考情報です。専門家による個別の助言に"
+            "代わるものではありません。"
+        )
+        for tip in generate_advice(
+            transactions_to_date, budgets, settings, accounts_df, net_worth, children_df
+        ):
             st.info(tip, icon=":material/lightbulb:")
 
         expense_target = settings[SETTING_ANNUAL_EXPENSE_TARGET]
@@ -1136,10 +1178,15 @@ with tab_budget:
                     st.error("カテゴリ名を入力してください。")
 
     for category in expense_categories:
-        cat_row_cols = st.columns([3, 1])
+        cat_row_cols = st.columns([3, 1, 1])
         with cat_row_cols[0]:
             st.write(category)
         with cat_row_cols[1]:
+            rename_category_control(
+                ":material/edit:", key=f"rename_category_{category}",
+                current_name=category, rename_fn=rename_expense_category,
+            )
+        with cat_row_cols[2]:
             if len(expense_categories) <= 1:
                 st.caption("最後の1つは削除できません")
             elif confirm_delete(":material/delete:", key=f"del_category_{category}"):
@@ -1184,16 +1231,28 @@ with tab_budget:
             st.markdown("&nbsp;")
             if st.form_submit_button("追加", type="primary", key="add_income_category_submit"):
                 if new_income_category_name.strip():
-                    add_income_category(new_income_category_name.strip())
-                    st.rerun()
+                    try:
+                        add_income_category(new_income_category_name.strip())
+                        st.rerun()
+                    except ReservedCategoryNameError:
+                        st.error(
+                            f"「{new_income_category_name.strip()}」は給与管理用に予約された"
+                            "名前のため使用できません。給与は「初期設定」タブの手取り年収で"
+                            "管理してください。"
+                        )
                 else:
                     st.error("カテゴリ名を入力してください。")
 
     for category in income_categories:
-        income_cat_row_cols = st.columns([3, 1])
+        income_cat_row_cols = st.columns([3, 1, 1])
         with income_cat_row_cols[0]:
             st.write(category)
         with income_cat_row_cols[1]:
+            rename_category_control(
+                ":material/edit:", key=f"rename_income_category_{category}",
+                current_name=category, rename_fn=rename_income_category,
+            )
+        with income_cat_row_cols[2]:
             if len(income_categories) <= 1:
                 st.caption("最後の1つは削除できません")
             elif confirm_delete(":material/delete:", key=f"del_income_category_{category}"):

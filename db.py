@@ -26,6 +26,38 @@ class RecordInUseError(Exception):
         super().__init__(f"record still in use: {usage}")
 
 
+class CategoryNameTakenError(Exception):
+    """A rename was refused because a category with the target name already exists.
+
+    Renaming into an existing name would require merging two categories' histories
+    (transactions, budgets, recurring expenses) into one, which rename_expense_category/
+    rename_income_category do not attempt - the caller should ask the user to pick a
+    different name, or delete the unused category first if that's really the intent.
+    """
+
+    def __init__(self, name: str):
+        self.name = name
+        super().__init__(f"category name already exists: {name}")
+
+
+class ReservedCategoryNameError(Exception):
+    """An income category was refused because its name is reserved for salary tracking.
+
+    Salary is tracked exclusively via the annual-income settings (SETTING_ANNUAL_INCOME_
+    HUSBAND/WIFE, prorated into dashboard/advice income totals) specifically so it is never
+    double-entered as a transaction too. A free-text income category named e.g. "給与" would
+    invite exactly that: a user logging real paychecks under it on top of the prorated salary
+    already baked into every income total. Blocking the obvious names at creation time backs
+    up the existing UI warning text with an actual guard.
+    """
+
+    def __init__(self, name: str):
+        self.name = name
+        super().__init__(f"reserved category name: {name}")
+
+
+RESERVED_INCOME_CATEGORY_NAMES = {"給与", "給料"}
+
 DEFAULT_INCOME_CATEGORIES = ["副業", "投資", "その他収入"]
 DEFAULT_EXPENSE_CATEGORIES = ["食費", "住居", "光熱費", "交通", "娯楽", "医療", "育児", "その他支出"]
 NISA_CATEGORIES = ["つみたて投資枠", "成長投資枠"]
@@ -297,12 +329,33 @@ def _run_migrations(conn: psycopg2.extensions.connection) -> None:
             )
             """
         )
+        # ボーナス加算月も金額と同様に履歴として管理する。以前はrecurring_expenses側の「今の」
+        # bonus_month_1/2を常に参照していたため、ボーナス月の設定を変えた後に金額を過去日付に
+        # さかのぼって修正すると、reconcile処理(_reconcile_posted_expense_amounts)が過去の記帳
+        # にまで「今の」ボーナス月を適用してしまい、正しく計上済みだった過去のボーナス加算額が
+        # 静かに消えたり、逆に付いたりする不具合があった。金額と同じ履歴行でバージョン管理する
+        # ことで、各記帳日の時点で実際に有効だったボーナス月を参照できるようにする。
+        cur.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name = 'recurring_expense_amount_history' AND column_name = 'bonus_month_1'"
+        )
+        if cur.fetchone() is None:
+            cur.execute("ALTER TABLE recurring_expense_amount_history ADD COLUMN bonus_month_1 INTEGER")
+            cur.execute("ALTER TABLE recurring_expense_amount_history ADD COLUMN bonus_month_2 INTEGER")
+            # 既存の履歴行にはボーナス月の記録がないため、移行時点の設定値でベストエフォート補完
+            # する(それ以前の変更で実際に何月だったかを示す記録は残っていないため)。
+            cur.execute(
+                "UPDATE recurring_expense_amount_history h "
+                "SET bonus_month_1 = r.bonus_month_1, bonus_month_2 = r.bonus_month_2 "
+                "FROM recurring_expenses r WHERE h.recurring_expense_id = r.id"
+            )
         # 既存の固定費には、その時点の設定額を「十分過去から有効」として1件だけ登録しておく。
         # こうしておけば以降は常に履歴テーブル経由で参照でき、fallback分岐を特別扱いしなくて済む。
         cur.execute(
             """
-            INSERT INTO recurring_expense_amount_history (recurring_expense_id, amount, bonus_amount, effective_from)
-            SELECT r.id, r.amount, r.bonus_amount, DATE '2000-01-01'
+            INSERT INTO recurring_expense_amount_history
+                (recurring_expense_id, amount, bonus_amount, bonus_month_1, bonus_month_2, effective_from)
+            SELECT r.id, r.amount, r.bonus_amount, r.bonus_month_1, r.bonus_month_2, DATE '2000-01-01'
             FROM recurring_expenses r
             WHERE NOT EXISTS (
                 SELECT 1 FROM recurring_expense_amount_history h WHERE h.recurring_expense_id = r.id
@@ -713,13 +766,15 @@ def add_recurring_expense(
             ),
         )
         rec_id = cur.fetchone()[0]
-        # 新規作成時点の金額を「作成月の初日から有効」として記録しておく。apply_recurring_expenses は
-        # 作成月より前を遡ってバックフィルしないため、この開始日で以降のすべての記帳をカバーできる。
+        # 新規作成時点の金額とボーナス月を「作成月の初日から有効」として記録しておく。
+        # apply_recurring_expenses は作成月より前を遡ってバックフィルしないため、この開始日で
+        # 以降のすべての記帳をカバーできる。
         today = today_jst()
         cur.execute(
             "INSERT INTO recurring_expense_amount_history "
-            "(recurring_expense_id, amount, bonus_amount, effective_from) VALUES (%s, %s, %s, %s)",
-            (rec_id, amount, bonus_amount, date_(today.year, today.month, 1)),
+            "(recurring_expense_id, amount, bonus_amount, bonus_month_1, bonus_month_2, effective_from) "
+            "VALUES (%s, %s, %s, %s, %s, %s)",
+            (rec_id, amount, bonus_amount, bonus_month_1, bonus_month_2, date_(today.year, today.month, 1)),
         )
 
 
@@ -740,17 +795,22 @@ def update_recurring_expense(
 ) -> None:
     """Update a recurring expense's settings.
 
-    If the amount or bonus_amount actually changed, records the new amount into the change
-    history as of `change_effective_from` (defaults to today) so that apply_recurring_expenses/
-    resume_recurring_expense keep using the OLD amount for any month before that date instead of
-    silently rewriting past months with today's rate. Also reconciles (UPDATEs) any transaction
-    already posted on/after `change_effective_from` to the newly-resolved amount, so backdating
-    a correction (e.g. "rent actually went up last month") fixes the already-posted month too,
-    not just future backfills.
+    If the amount, bonus_amount, or either bonus month actually changed, records the new values
+    into the change history as of `change_effective_from` (defaults to today) so that
+    apply_recurring_expenses/resume_recurring_expense keep using the OLD amount/bonus schedule
+    for any month before that date instead of silently rewriting past months with today's
+    settings. Bonus months are versioned in the same history row as the amount (not read live
+    from recurring_expenses) specifically so that changing which months are bonus months doesn't
+    get retroactively applied when reconciling an unrelated, separately-backdated amount change.
+    Also reconciles (UPDATEs) any transaction already posted on/after `change_effective_from` to
+    the newly-resolved amount/bonus, so backdating a correction (e.g. "rent actually went up last
+    month") fixes the already-posted month too, not just future backfills.
     """
     with _cursor() as cur:
         cur.execute(
-            "SELECT amount, bonus_amount FROM recurring_expenses WHERE id = %s", (recurring_id,)
+            "SELECT amount, bonus_amount, bonus_month_1, bonus_month_2 "
+            "FROM recurring_expenses WHERE id = %s",
+            (recurring_id,),
         )
         old_row = cur.fetchone()
         cur.execute(
@@ -771,16 +831,16 @@ def update_recurring_expense(
                 recurring_id,
             ),
         )
-        if old_row is not None and (amount, bonus_amount) != tuple(old_row):
+        new_values = (amount, bonus_amount, bonus_month_1, bonus_month_2)
+        if old_row is not None and new_values != tuple(old_row):
             effective_from = change_effective_from or today_jst()
             cur.execute(
                 "INSERT INTO recurring_expense_amount_history "
-                "(recurring_expense_id, amount, bonus_amount, effective_from) VALUES (%s, %s, %s, %s)",
-                (recurring_id, amount, bonus_amount, effective_from),
+                "(recurring_expense_id, amount, bonus_amount, bonus_month_1, bonus_month_2, effective_from) "
+                "VALUES (%s, %s, %s, %s, %s, %s)",
+                (recurring_id, amount, bonus_amount, bonus_month_1, bonus_month_2, effective_from),
             )
-            _reconcile_posted_expense_amounts(
-                cur, recurring_id, effective_from, name, bonus_month_1, bonus_month_2
-            )
+            _reconcile_posted_expense_amounts(cur, recurring_id, effective_from, name)
 
 
 @_with_reconnect
@@ -806,23 +866,27 @@ def _next_month(year: int, month: int) -> tuple[int, int]:
 
 
 def _resolve_historical_amount(
-    history: list[tuple[int, int, date_, int]],
+    history: list[tuple],
     as_of_date: date_,
-    fallback_amount: int,
-    fallback_bonus_amount: int,
-) -> tuple[int, int]:
-    """Pick the (amount, bonus_amount) in effect on `as_of_date` from a list of
-    (amount, bonus_amount, effective_from, id) change-history rows.
+    fallback: tuple,
+) -> tuple:
+    """Pick the payload in effect on `as_of_date` from a list of change-history rows shaped
+    (*payload, effective_from, id).
 
     Pure logic (no DB access), split out from _historical_recurring_expense_amount so it can
     be unit-tested directly. Ties on effective_from are broken by id, matching the original
-    "ORDER BY effective_from DESC, id DESC LIMIT 1" query.
+    "ORDER BY effective_from DESC, id DESC LIMIT 1" query. Generic over the payload shape so the
+    same resolver serves recurring expenses ((amount, bonus_amount, bonus_month_1, bonus_month_2))
+    and recurring investments ((amount,)) alike - versioning the bonus month(s) alongside the
+    amount, instead of always reading the recurring expense's current live bonus_month_1/2,
+    matters because otherwise a later change to which months are bonus months would get
+    retroactively applied when reconciling/backfilling postings dated under a different schedule.
     """
-    candidates = [row for row in history if row[2] <= as_of_date]
+    candidates = [row for row in history if row[-2] <= as_of_date]
     if not candidates:
-        return (fallback_amount, fallback_bonus_amount)
-    amount, bonus_amount, _effective_from, _id = max(candidates, key=lambda row: (row[2], row[3]))
-    return (amount, bonus_amount)
+        return fallback
+    row = max(candidates, key=lambda row: (row[-2], row[-1]))
+    return row[:-2]
 
 
 def _plan_recurring_expense_postings(
@@ -831,17 +895,21 @@ def _plan_recurring_expense_postings(
     day_of_month: int,
     end_year: int | None,
     end_month: int | None,
-    history: list[tuple[int, int, date_, int]],
+    history: list[tuple[int, int, int | None, int | None, date_, int]],
     fallback_amount: int,
     fallback_bonus_amount: int,
-    bonus_month_1: int | None,
-    bonus_month_2: int | None,
+    fallback_bonus_month_1: int | None,
+    fallback_bonus_month_2: int | None,
     name: str,
     skipped_months: set[tuple[int, int]],
 ) -> list[tuple[date_, int, str]]:
     """The (date, amount, memo) rows apply_recurring_expenses should insert for one recurring
     expense, walking forward from the month after `last_date` (or the current month, if there's
     no prior posting) up to today.
+
+    `history` rows are (amount, bonus_amount, bonus_month_1, bonus_month_2, effective_from, id).
+    The bonus month(s) are resolved per posting date alongside the amount rather than taken from
+    the caller's current live setting (see _resolve_historical_amount's docstring for why).
 
     Pure logic (no DB access), split out from apply_recurring_expenses so the backfill/bonus-
     month/end-date/skip decisions can be unit-tested directly instead of only through a live
@@ -860,12 +928,14 @@ def _plan_recurring_expense_postings(
             break
         if (year, month) not in skipped_months:
             applied_date = date_(year, month, day_of_month)
-            hist_amount, hist_bonus_amount = _resolve_historical_amount(
-                history, applied_date, fallback_amount, fallback_bonus_amount
+            hist_amount, hist_bonus_amount, hist_bonus_month_1, hist_bonus_month_2 = _resolve_historical_amount(
+                history,
+                applied_date,
+                (fallback_amount, fallback_bonus_amount, fallback_bonus_month_1, fallback_bonus_month_2),
             )
             applied_amount = hist_amount
             memo = f"{name}（固定費自動引き落とし）"
-            if hist_bonus_amount and month in (bonus_month_1, bonus_month_2):
+            if hist_bonus_amount and month in (hist_bonus_month_1, hist_bonus_month_2):
                 applied_amount += hist_bonus_amount
                 memo = f"{name}（固定費自動引き落とし・ボーナス加算）"
             postings.append((applied_date, applied_amount, memo))
@@ -877,7 +947,7 @@ def _plan_recurring_investment_postings(
     today: date_,
     last_date: date_ | None,
     day_of_month: int,
-    history: list[tuple[int, int, date_, int]],
+    history: list[tuple[int, date_, int]],
     fallback_amount: int,
     owner: str,
     skipped_months: set[tuple[int, int]],
@@ -896,7 +966,7 @@ def _plan_recurring_investment_postings(
             break
         if (year, month) not in skipped_months:
             applied_date = date_(year, month, day_of_month)
-            applied_amount, _unused_bonus = _resolve_historical_amount(history, applied_date, fallback_amount, 0)
+            (applied_amount,) = _resolve_historical_amount(history, applied_date, (fallback_amount,))
             postings.append((applied_date, applied_amount, f"{owner}の定期積立"))
         year, month = _next_month(year, month)
     return postings
@@ -908,14 +978,21 @@ def _historical_recurring_expense_amount(
     as_of_date: date_,
     fallback_amount: int,
     fallback_bonus_amount: int,
-) -> tuple[int, int]:
-    """The (amount, bonus_amount) that was actually in effect on `as_of_date`, per the change history."""
+    fallback_bonus_month_1: int | None = None,
+    fallback_bonus_month_2: int | None = None,
+) -> tuple[int, int, int | None, int | None]:
+    """The (amount, bonus_amount, bonus_month_1, bonus_month_2) actually in effect on
+    `as_of_date`, per the change history."""
     cur.execute(
-        "SELECT amount, bonus_amount, effective_from, id FROM recurring_expense_amount_history "
-        "WHERE recurring_expense_id = %s",
+        "SELECT amount, bonus_amount, bonus_month_1, bonus_month_2, effective_from, id "
+        "FROM recurring_expense_amount_history WHERE recurring_expense_id = %s",
         (recurring_expense_id,),
     )
-    return _resolve_historical_amount(cur.fetchall(), as_of_date, fallback_amount, fallback_bonus_amount)
+    return _resolve_historical_amount(
+        cur.fetchall(),
+        as_of_date,
+        (fallback_amount, fallback_bonus_amount, fallback_bonus_month_1, fallback_bonus_month_2),
+    )
 
 
 def _reconcile_posted_expense_amounts(
@@ -923,27 +1000,29 @@ def _reconcile_posted_expense_amounts(
     recurring_expense_id: int,
     effective_from: date_,
     name: str,
-    bonus_month_1: int | None,
-    bonus_month_2: int | None,
 ) -> None:
-    """Correct already-posted transactions whose date falls on/after a (possibly backdated) amount change.
+    """Correct already-posted transactions whose date falls on/after a (possibly backdated)
+    amount/bonus-month change.
 
     update_recurring_expense() recording a new history row only changes what future backfills use
     UNLESS this also runs: without it, setting change_effective_from to a past date would silently
-    leave months that were already posted (with the old amount, before the correction) untouched,
-    even though the edit form's help text tells the user those months get the new amount too.
+    leave months that were already posted (with the old amount/bonus schedule, before the
+    correction) untouched, even though the edit form's help text tells the user those months get
+    the new values too. Resolves amount AND bonus month per transaction's own date via
+    _historical_recurring_expense_amount (not the caller's current live settings), so a
+    transaction dated before this change keeps whatever schedule actually applied to it.
     """
     cur.execute(
         "SELECT id, date, amount FROM transactions WHERE recurring_expense_id = %s AND date >= %s",
         (recurring_expense_id, effective_from),
     )
     for txn_id, txn_date, old_amount in cur.fetchall():
-        hist_amount, hist_bonus_amount = _historical_recurring_expense_amount(
-            cur, recurring_expense_id, txn_date, 0, 0
+        hist_amount, hist_bonus_amount, hist_bonus_month_1, hist_bonus_month_2 = (
+            _historical_recurring_expense_amount(cur, recurring_expense_id, txn_date, 0, 0, None, None)
         )
         new_amount = hist_amount
         memo = f"{name}（固定費自動引き落とし）"
-        if hist_bonus_amount and txn_date.month in (bonus_month_1, bonus_month_2):
+        if hist_bonus_amount and txn_date.month in (hist_bonus_month_1, hist_bonus_month_2):
             new_amount += hist_bonus_amount
             memo = f"{name}（固定費自動引き落とし・ボーナス加算）"
         if new_amount != old_amount:
@@ -961,16 +1040,15 @@ def _historical_recurring_investment_amount(
 ) -> int:
     """The amount that was actually in effect on `as_of_date`, per the change history.
 
-    Reuses _resolve_historical_amount (bonus slot unused/zeroed) rather than duplicating its
-    tie-breaking logic for a second, near-identical resolver.
+    Reuses _resolve_historical_amount rather than duplicating its tie-breaking logic for a
+    second, near-identical resolver.
     """
     cur.execute(
         "SELECT amount, effective_from, id FROM recurring_investment_amount_history "
         "WHERE recurring_investment_id = %s",
         (recurring_investment_id,),
     )
-    history = [(amount, 0, effective_from, id_) for amount, effective_from, id_ in cur.fetchall()]
-    resolved_amount, _unused_bonus = _resolve_historical_amount(history, as_of_date, fallback_amount, 0)
+    (resolved_amount,) = _resolve_historical_amount(cur.fetchall(), as_of_date, (fallback_amount,))
     return resolved_amount
 
 
@@ -1039,8 +1117,8 @@ def apply_recurring_expenses() -> None:
             )
             skipped_months = {(y, m) for y, m in cur.fetchall()}
             cur.execute(
-                "SELECT amount, bonus_amount, effective_from, id FROM recurring_expense_amount_history "
-                "WHERE recurring_expense_id = %s",
+                "SELECT amount, bonus_amount, bonus_month_1, bonus_month_2, effective_from, id "
+                "FROM recurring_expense_amount_history WHERE recurring_expense_id = %s",
                 (rec_id,),
             )
             history = cur.fetchall()
@@ -1107,12 +1185,14 @@ def resume_recurring_expense(recurring_expense_id: int, year: int, month: int) -
             return
         name, category, amount, account_id, day_of_month, bonus_amount, bonus_month_1, bonus_month_2 = row
         applied_date = date_(year, month, day_of_month)
-        hist_amount, hist_bonus_amount = _historical_recurring_expense_amount(
-            cur, recurring_expense_id, applied_date, amount, bonus_amount
+        hist_amount, hist_bonus_amount, hist_bonus_month_1, hist_bonus_month_2 = (
+            _historical_recurring_expense_amount(
+                cur, recurring_expense_id, applied_date, amount, bonus_amount, bonus_month_1, bonus_month_2
+            )
         )
         applied_amount = hist_amount
         memo = f"{name}（固定費自動引き落とし）"
-        if hist_bonus_amount and month in (bonus_month_1, bonus_month_2):
+        if hist_bonus_amount and month in (hist_bonus_month_1, hist_bonus_month_2):
             applied_amount += hist_bonus_amount
             memo = f"{name}（固定費自動引き落とし・ボーナス加算）"
         cur.execute(
@@ -1229,7 +1309,7 @@ def apply_recurring_investments() -> None:
                 "WHERE recurring_investment_id = %s",
                 (rec_id,),
             )
-            history = [(hist_amount, 0, effective_from, hist_id) for hist_amount, effective_from, hist_id in cur.fetchall()]
+            history = cur.fetchall()
             postings = _plan_recurring_investment_postings(
                 today, last_date, day_of_month, history, amount, owner, skipped_months
             )
@@ -1378,7 +1458,36 @@ def get_expense_categories() -> list[str]:
 
 
 @_with_reconnect
+def rename_expense_category(old_name: str, new_name: str) -> None:
+    """Rename an expense category everywhere it's referenced, in one transaction.
+
+    Unlike delete_expense_category, this works even while the category is in use: it's the
+    only way to fix a typo'd/duplicated category name without abandoning its history, since
+    transactions.category/recurring_expenses.category/budgets.category are free text with no
+    FK back to expense_categories, and delete_expense_category refuses to delete a category
+    that's still referenced. Raises CategoryNameTakenError instead of merging if `new_name`
+    already exists (merging two categories' budgets/history is a separate, unimplemented
+    concern - go through delete_expense_category on the now-unused old name to merge manually).
+    """
+    with _cursor() as cur:
+        cur.execute("SELECT 1 FROM expense_categories WHERE name = %s", (new_name,))
+        if cur.fetchone() is not None:
+            raise CategoryNameTakenError(new_name)
+        cur.execute("UPDATE expense_categories SET name = %s WHERE name = %s", (new_name, old_name))
+        cur.execute(
+            "UPDATE transactions SET category = %s WHERE category = %s AND type = 'expense'",
+            (new_name, old_name),
+        )
+        cur.execute(
+            "UPDATE recurring_expenses SET category = %s WHERE category = %s", (new_name, old_name)
+        )
+        cur.execute("UPDATE budgets SET category = %s WHERE category = %s", (new_name, old_name))
+
+
+@_with_reconnect
 def add_income_category(name: str) -> None:
+    if name in RESERVED_INCOME_CATEGORY_NAMES:
+        raise ReservedCategoryNameError(name)
     with _cursor() as cur:
         cur.execute(
             "INSERT INTO income_categories (name) VALUES (%s) ON CONFLICT (name) DO NOTHING", (name,)
@@ -1420,6 +1529,28 @@ def get_income_categories() -> list[str]:
         cur.execute("SELECT name FROM income_categories ORDER BY id")
         rows = cur.fetchall()
     return [row[0] for row in rows]
+
+
+@_with_reconnect
+def rename_income_category(old_name: str, new_name: str) -> None:
+    """Rename an income category everywhere it's referenced (see rename_expense_category).
+
+    Also refuses to rename into RESERVED_INCOME_CATEGORY_NAMES, for the same reason
+    add_income_category refuses to create them: it would let salary be logged as a
+    transaction under a different name than the reserved one, silently reintroducing the
+    exact double-count with the annual-income settings this guard exists to prevent.
+    """
+    if new_name in RESERVED_INCOME_CATEGORY_NAMES:
+        raise ReservedCategoryNameError(new_name)
+    with _cursor() as cur:
+        cur.execute("SELECT 1 FROM income_categories WHERE name = %s", (new_name,))
+        if cur.fetchone() is not None:
+            raise CategoryNameTakenError(new_name)
+        cur.execute("UPDATE income_categories SET name = %s WHERE name = %s", (new_name, old_name))
+        cur.execute(
+            "UPDATE transactions SET category = %s WHERE category = %s AND type = 'income'",
+            (new_name, old_name),
+        )
 
 
 @_with_reconnect
